@@ -1,7 +1,5 @@
-from typing import List
 import torch
-from transformers import AutoTokenizer, AutoModel
-from vllm import LLM, SamplingParams
+from transformers import AutoTokenizer, AutoModel, AutoConfig
 import math
 import numpy as np
 import torchvision.transforms as T
@@ -9,18 +7,16 @@ from PIL import Image
 from torchvision.transforms.functional import InterpolationMode
 from .base_model import BaseVLLM
 import logging
+from typing import List
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 class InternVLModel(BaseVLLM):
-    def __init__(self, model_name="OpenGVLab/InternVL3-8B", use_vllm=True, **kwargs):
+    def __init__(self, model_name="OpenGVLab/InternVL3-8B-Instruct", **kwargs):
         super().__init__(model_name, **kwargs)
-        self.use_vllm = use_vllm
         self.model = None
         self.tokenizer = None
         self.load_model()
@@ -34,6 +30,21 @@ class InternVLModel(BaseVLLM):
         ])
         return transform
     
+    def find_closest_aspect_ratio(self, aspect_ratio, target_ratios, width, height, image_size):
+        best_ratio_diff = float('inf')
+        best_ratio = (1, 1)
+        area = width * height
+        for ratio in target_ratios:
+            target_aspect_ratio = ratio[0] / ratio[1]
+            ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+            if ratio_diff < best_ratio_diff:
+                best_ratio_diff = ratio_diff
+                best_ratio = ratio
+            elif ratio_diff == best_ratio_diff:
+                if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                    best_ratio = ratio
+        return best_ratio
+    
     def dynamic_preprocess(self, image, min_num=1, max_num=12, image_size=448, use_thumbnail=False):
         orig_width, orig_height = image.size
         aspect_ratio = orig_width / orig_height
@@ -45,23 +56,13 @@ class InternVLModel(BaseVLLM):
         )
         target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
         
-        best_ratio_diff = float('inf')
-        best_ratio = (1, 1)
-        area = orig_width * orig_height
+        target_aspect_ratio = self.find_closest_aspect_ratio(
+            aspect_ratio, target_ratios, orig_width, orig_height, image_size
+        )
         
-        for ratio in target_ratios:
-            target_aspect_ratio = ratio[0] / ratio[1]
-            ratio_diff = abs(aspect_ratio - target_aspect_ratio)
-            if ratio_diff < best_ratio_diff:
-                best_ratio_diff = ratio_diff
-                best_ratio = ratio
-            elif ratio_diff == best_ratio_diff:
-                if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
-                    best_ratio = ratio
-        
-        target_width = image_size * best_ratio[0]
-        target_height = image_size * best_ratio[1]
-        blocks = best_ratio[0] * best_ratio[1]
+        target_width = image_size * target_aspect_ratio[0]
+        target_height = image_size * target_aspect_ratio[1]
+        blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
         
         resized_img = image.resize((target_width, target_height))
         processed_images = []
@@ -84,96 +85,101 @@ class InternVLModel(BaseVLLM):
     
     def load_image(self, image, input_size=448, max_num=12):
         transform = self.build_transform(input_size=input_size)
-        images = self.dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
-        pixel_values = [transform(img) for img in images]
+        images = self.dynamic_preprocess(
+            image, image_size=input_size, use_thumbnail=True, max_num=max_num
+        )
+        pixel_values = [transform(image) for image in images]
         pixel_values = torch.stack(pixel_values)
         return pixel_values
     
     def load_model(self):
-        if self.use_vllm:
-            self.model = LLM(
-                model=self.model_name,
-                trust_remote_code=True,
-                max_model_len=8192,
-                tensor_parallel_size=1,
-                dtype=torch.bfloat16
-            )
-            self.tokenizer = self.model.get_tokenizer()
-        else:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.model_name, 
-                trust_remote_code=True, 
-                use_fast=False
-            )
-            self.model = AutoModel.from_pretrained(
-                self.model_name,
-                torch_dtype=torch.bfloat16,
-                low_cpu_mem_usage=True,
-                use_flash_attn=True,
-                trust_remote_code=True,
-                device_map="auto"
-            ).eval()
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_name, 
+            trust_remote_code=True, 
+            use_fast=False
+        )
+        self.model = AutoModel.from_pretrained(
+            self.model_name,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            use_flash_attn=True,
+            trust_remote_code=True,
+            device_map="auto"
+        ).eval()
+        
+        logger.info(f"Model loaded: {self.model_name}")
+        logger.info(f"Model device: {next(self.model.parameters()).device}")
     
-    def format_prompt_with_images(self, images: List[Image.Image], prompt: str):
-        if not images:
-            return prompt, None
-        
-        image_tokens = ""
-        pixel_values_list = []
-        
-        for img in images:
-            pixel_values = self.load_image(img)
-            pixel_values_list.append(pixel_values)
-            image_tokens += "<image>\n"
-        
-        formatted_prompt = image_tokens + prompt
-        
-        if pixel_values_list:
-            all_pixel_values = torch.cat(pixel_values_list, dim=0)
-            return formatted_prompt, all_pixel_values
-        
-        return formatted_prompt, None
-    
-    def generate_text(self, images: List[Image.Image], prompt: str, max_new_tokens=512, debug=False, **kwargs) -> str:
+    def generate_text(self, images: List[Image.Image], prompt: str, max_new_tokens=32, debug=False, **kwargs) -> str:
         if debug:
             logger.info(f"Input prompt: {prompt}")
             logger.info(f"Number of images: {len(images)}")
         
-        if self.use_vllm:
-            formatted_prompt, pixel_values = self.format_prompt_with_images(images, prompt)
-            
-            sampling_params = SamplingParams(
-                temperature=0.0,
-                max_tokens=max_new_tokens,
-                stop_token_ids=[self.tokenizer.eos_token_id] if hasattr(self.tokenizer, 'eos_token_id') else None
-            )
-            
-            outputs = self.model.generate([formatted_prompt], sampling_params)
-            response = outputs[0].outputs[0].text.strip()
+        # Process images according to InternVL3 documentation
+        if not images:
+            pixel_values = None
+            num_patches_list = None
+        elif len(images) == 1:
+            # Single image case
+            pixel_values = self.load_image(images[0], max_num=12).to(torch.bfloat16).cuda()
+            num_patches_list = None
+            if debug:
+                logger.info(f"Single image - pixel_values shape: {pixel_values.shape}")
         else:
-            formatted_prompt, pixel_values = self.format_prompt_with_images(images, prompt)
+            # Multiple images case
+            pixel_values_list = []
+            num_patches_list = []
             
-            if pixel_values is not None:
-                pixel_values = pixel_values.to(torch.bfloat16).cuda()
+            for img in images:
+                img_pixel_values = self.load_image(img, max_num=6)  # Reduce for multiple images
+                pixel_values_list.append(img_pixel_values)
+                num_patches_list.append(img_pixel_values.size(0))
             
-            # Fixed generation config to avoid warnings
-            generation_config = dict(
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id
-            )
+            pixel_values = torch.cat(pixel_values_list, dim=0).to(torch.bfloat16).cuda()
             
-            response = self.model.chat(
-                self.tokenizer, 
-                pixel_values, 
-                formatted_prompt, 
-                generation_config
-            )
+            if debug:
+                logger.info(f"Multiple images - pixel_values shape: {pixel_values.shape}")
+                logger.info(f"num_patches_list: {num_patches_list}")
+        
+        # Generation configuration following InternVL3 docs
+        generation_config = dict(
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=self.tokenizer.eos_token_id,
+            eos_token_id=self.tokenizer.eos_token_id
+        )
+        
+        # Generate response using InternVL3's chat method
+        try:
+            if pixel_values is not None and num_patches_list is not None:
+                # Multiple images
+                response = self.model.chat(
+                    self.tokenizer,
+                    pixel_values,
+                    prompt,
+                    generation_config,
+                    num_patches_list=num_patches_list
+                )
+            else:
+                # Single image or no image
+                response = self.model.chat(
+                    self.tokenizer,
+                    pixel_values,
+                    prompt,
+                    generation_config
+                )
+            
             response = response.strip()
+            
+        except Exception as e:
+            logger.error(f"Generation error: {e}")
+            if debug:
+                import traceback
+                logger.error(traceback.format_exc())
+            response = ""
         
         if debug:
-            logger.info(f"Model response: {response}")
+            logger.info(f"Model response: '{response}'")
         
         return response
     

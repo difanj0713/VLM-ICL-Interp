@@ -1,11 +1,7 @@
 python scripts/run_inference.py \
-    --model_name OpenGVLab/InternVL3-8B \
-    --model_type internvl \
+    --model_name OpenGVLab/InternVL3-8B-Instruct \
     --dataset operator_induction \
     --data_dir ./data \
     --n_shot 0 1 2 4 8 \
-    --max_new_tokens 50 \
-    --output_dir ./results \
     --debug \
-    --debug_samples 5 \
-    --seed 42
+    --debug_samples 5
