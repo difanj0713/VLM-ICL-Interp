@@ -126,22 +126,27 @@ class InternVLModel(BaseVLLM):
             if debug:
                 logger.info(f"Single image - pixel_values shape: {pixel_values.shape}")
         else:
-            # Multiple images case
+            # Multiple images case - following InternVL3 documentation exactly
             pixel_values_list = []
             num_patches_list = []
             
-            for img in images:
-                img_pixel_values = self.load_image(img, max_num=6)  # Reduce for multiple images
+            for i, img in enumerate(images):
+                # Process each image individually
+                img_pixel_values = self.load_image(img, max_num=6)  # Reduce max_num for multiple images
                 pixel_values_list.append(img_pixel_values)
                 num_patches_list.append(img_pixel_values.size(0))
+                
+                if debug:
+                    logger.info(f"Image {i+1} - pixel_values shape: {img_pixel_values.shape}, patches: {img_pixel_values.size(0)}")
             
+            # Concatenate following InternVL3 pattern
             pixel_values = torch.cat(pixel_values_list, dim=0).to(torch.bfloat16).cuda()
             
             if debug:
                 logger.info(f"Multiple images - pixel_values shape: {pixel_values.shape}")
                 logger.info(f"num_patches_list: {num_patches_list}")
         
-        # Generation configuration following InternVL3 docs
+        # Generation configuration
         generation_config = dict(
             max_new_tokens=max_new_tokens,
             do_sample=False,
@@ -152,7 +157,7 @@ class InternVLModel(BaseVLLM):
         # Generate response using InternVL3's chat method
         try:
             if pixel_values is not None and num_patches_list is not None:
-                # Multiple images
+                # Multiple images - following InternVL3 documentation
                 response = self.model.chat(
                     self.tokenizer,
                     pixel_values,
