@@ -29,9 +29,9 @@ class OperatorInductionTask(BaseTask):
                            "results of the in-context examples and calculate the result.")
         
         if mode == "constrained":
-            return base_instruction + " Answer with only the final number."
+            return base_instruction + " Answer with only the final number. Answer: "
         elif mode == "free":
-            return base_instruction + " Show your reasoning step by step and provide the final answer."
+            return base_instruction + " Show your reasoning step by step and provide the final answer. Answer: "
         else:
             return base_instruction
     
@@ -39,7 +39,7 @@ class OperatorInductionTask(BaseTask):
         image_part = "<image>" if include_image_token else ""
         
         if mode == "constrained":
-            return f"{image_part}What is the result of the following mathematical expression?\n{support_item['answer']}"
+            return f"{image_part}What is the result of the following mathematical expression?\nAnswer:{support_item['answer']}"
         elif mode == "free":
             # For free generation, show more natural demonstrations
             return f"{image_part}What is the result of the following mathematical expression?\nAnswer: {support_item['answer']}"
@@ -69,7 +69,7 @@ class OperatorInductionTask(BaseTask):
         image_part = "<image>" if include_image_token else ""
         
         if mode == "free":
-            return f"{image_part}What is the result of the following mathematical expression? Show your reasoning step by step."
+            return f"{image_part}What is the result of the following mathematical expression? Think for this question step by step."
         else:
             return f"{image_part}What is the result of the following mathematical expression?"
     

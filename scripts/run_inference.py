@@ -113,9 +113,9 @@ def build_vl_icl_prompt(task, demonstrations, query, mode="constrained", debug=F
     
     # Prediction: [Answer]
     if mode == "free":
-        prompt_parts.append("Please solve this step by step:")
+        prompt_parts.append("Answer:")
     else:
-        prompt_parts.append("Prediction:")
+        prompt_parts.append("Answer:")
     
     full_prompt = "\n\n".join(prompt_parts)
     
@@ -158,7 +158,7 @@ def run_inference(args):
     
     logger.info(f"Loading model: {args.model_name}")
     model = create_model(args.model_type, args.model_name)
-    pdb.set_trace()
+    # pdb.set_trace()
     
     logger.info(f"Loading task: {args.dataset}")
     task = create_task(args.dataset, args.data_dir)
