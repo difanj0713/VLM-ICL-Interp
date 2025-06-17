@@ -2,9 +2,7 @@ import os
 import sys
 import torch
 import numpy as np
-import json
 import pickle
-from PIL import Image
 from typing import List, Dict, Tuple
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel
@@ -22,39 +20,37 @@ class VLICLHiddenStatesExtractor:
         self.task = None
         self.bge_model = None
         self.bge_tokenizer = None
-        self.hidden_states = []
-        self.hooks = []
+        
+        self.base_instruction = ("The image contains two digit numbers and a ? representing the mathematical operator. "
+                               "Induce the mathematical operator (addition, multiplication, minus) according to the "
+                               "results of the in-context examples and calculate the result.")
         
     def load_model(self):
-        print(f"Loading InternVL model: {self.model_name}")
+        print(f"Loading model: {self.model_name}")
         self.model = create_model('internvl', self.model_name)
         self.tokenizer = self.model.tokenizer
         self.task = OperatorInductionTask(self.data_dir)
-        print("InternVL model and task loaded successfully")
         
     def load_bge_model(self):
-        print("Loading BGE M3 reference encoder...")
         self.bge_tokenizer = AutoTokenizer.from_pretrained('BAAI/bge-m3')
         self.bge_model = AutoModel.from_pretrained('BAAI/bge-m3')
         self.bge_model.cuda()
         self.bge_model.eval()
-        print("BGE M3 model loaded successfully")
         
-    def create_vlicl_prompt_and_images(self, query: Dict, n_shot: int = 4) -> Tuple[str, List[Image.Image]]:
+    def create_vlicl_prompt_and_images(self, query: Dict, n_shot: int = 4):
         demonstrations = self.task.select_demonstrations(query, n_shot)
         
-        prompt_parts = []
+        prompt_parts = [self.base_instruction]
         images = []
         
         for demo in demonstrations:
             demo_text = self.task.format_demonstration(demo, include_image_token=True, mode="constrained")
             prompt_parts.append(demo_text)
-            
             if 'image' in demo:
                 for img_path in demo['image']:
                     images.append(self.task.load_image(img_path))
         
-        query_text = self.task.format_query(query, include_image_token=True, mode="constrained") + " Answer:"
+        query_text = self.task.format_query(query, include_image_token=True, mode="constrained") + " Answer: "
         prompt_parts.append(query_text)
         
         if 'image' in query:
@@ -64,161 +60,54 @@ class VLICLHiddenStatesExtractor:
         full_prompt = "\n\n".join(prompt_parts)
         return full_prompt, images
     
-    def find_query_token_positions(self, input_ids: torch.Tensor) -> Dict[str, int]:
-        if input_ids.dim() > 1:
-            tokens = input_ids.squeeze().tolist()
-        else:
-            tokens = input_ids.tolist()
-        
+    def find_answer_positions(self, prompt: str):
+        inputs = self.tokenizer(prompt, return_tensors='pt')
+        input_ids = inputs['input_ids'].squeeze()
+        tokens = input_ids.tolist()
         token_texts = [self.tokenizer.decode([tid]) for tid in tokens]
         
-        positions = {
-            'query_forerunner': None,
-            'last_input_text': None, 
-            'query_label': None,
-            'all_answer_positions': []
-        }
+        answer_positions = []
+        colon_positions = []
         
-        answer_patterns = ['Answer:', 'answer:', 'Answer', 'answer']
+        for i, text in enumerate(token_texts):
+            if 'Answer' in text or 'answer' in text:
+                answer_positions.append(i)
+            if ':' in text and i > 0:
+                colon_positions.append(i)
         
-        for i, token_text in enumerate(token_texts):
-            for pattern in answer_patterns:
-                if pattern in token_text:
-                    positions['all_answer_positions'].append(i)
-                    if i + 1 < len(token_texts) and ':' in token_texts[i + 1]:
-                        positions['all_answer_positions'].append(i + 1)
-                    break
-        
-        if positions['all_answer_positions']:
-            last_answer_pos = positions['all_answer_positions'][-1]
-            
-            for i in range(last_answer_pos, min(last_answer_pos + 3, len(token_texts))):
-                if ':' in token_texts[i]:
-                    positions['query_forerunner'] = i
-                    break
-            
-            if positions['query_forerunner'] is not None:
-                positions['query_label'] = positions['query_forerunner'] + 1
-                
-                answer_start = None
-                for pos in reversed(positions['all_answer_positions']):
-                    if 'Answer' in token_texts[pos]:
-                        answer_start = pos
-                        break
-                
-                if answer_start is not None and answer_start > 0:
-                    positions['last_input_text'] = answer_start - 1
-        
-        return positions
+        return answer_positions, colon_positions, len(tokens)
     
-    def register_hooks(self):
-        self.hidden_states = []
-        self.hooks = []
+    def extract_representations(self, prompt: str, images: List, target_positions: List[int]):
+        layer_outputs = {}
+        hooks = []
         
-        def hook_fn(module, input, output):
-            if isinstance(output, tuple):
-                hidden_state = output[0]
-            else:
-                hidden_state = output
-            if hidden_state.dtype == torch.bfloat16:
-                hidden_state = hidden_state.float()
-            self.hidden_states.append(hidden_state.detach().cpu())
-        
-        if hasattr(self.model.model, 'language_model'):
-            layers = self.model.model.language_model.model.layers
-        elif hasattr(self.model.model, 'model') and hasattr(self.model.model.model, 'layers'):
-            layers = self.model.model.model.layers
-        else:
-            raise ValueError("Cannot find language model layers")
-        
-        for layer in layers:
-            handle = layer.register_forward_hook(hook_fn)
-            self.hooks.append(handle)
-    
-    def remove_hooks(self):
-        for handle in self.hooks:
-            handle.remove()
-        self.hooks.clear()
-    
-    def extract_hidden_states_at_position(self, position: int) -> List[np.ndarray]:
-        layer_representations = []
-        
-        for layer_hidden in self.hidden_states:
-            if layer_hidden.dim() == 3:
-                batch_size, seq_len, hidden_dim = layer_hidden.shape
-                if position is not None and 0 <= position < seq_len:
-                    extracted_tensor = layer_hidden[0, position, :]
+        def create_hook(layer_name):
+            def hook_fn(module, input, output):
+                if isinstance(output, tuple):
+                    hidden_states = output[0]
                 else:
-                    extracted_tensor = layer_hidden[0, -1, :]
-            else:
-                extracted_tensor = layer_hidden.flatten()[:3584]
-            
-            if extracted_tensor.dtype == torch.bfloat16:
-                extracted_tensor = extracted_tensor.float()
-            
-            extracted = extracted_tensor.numpy()
-            layer_representations.append(extracted)
+                    hidden_states = output
+                if hidden_states.dtype == torch.bfloat16:
+                    hidden_states = hidden_states.float()
+                layer_outputs[layer_name] = hidden_states.detach().cpu()
+            return hook_fn
         
-        return layer_representations
-    
-    def get_bge_reference_embedding(self, query_identifier: str) -> np.ndarray:
-        """
-        Create a unique BGE embedding for each sample
-        For OperatorInduction, use the operator and image info to create unique identifiers
-        """
-        if self.bge_model is None:
-            self.load_bge_model()
+        language_model = self.model.model.language_model
+        num_layers = len(language_model.model.layers)
         
-        # Create a unique text for each sample instead of using the same question
-        inputs = self.bge_tokenizer(query_identifier, return_tensors='pt', truncation=True, max_length=512)
-        inputs = {k: v.cuda() for k, v in inputs.items()}
-        
-        with torch.no_grad():
-            outputs = self.bge_model(**inputs)
-            embedding_tensor = outputs.last_hidden_state[:, 0, :].squeeze().cpu()
-            
-            if embedding_tensor.dtype == torch.bfloat16:
-                embedding_tensor = embedding_tensor.float()
-            
-            embedding = embedding_tensor.numpy()
-        
-        return embedding
-    
-    def create_unique_query_identifier(self, query: Dict, sample_idx: int) -> str:
-        """
-        Create a unique identifier for each sample to get diverse BGE embeddings
-        """
-        operator = query.get('operator', 'unknown')
-        
-        # Create a unique string that captures the essence of this specific sample
-        base_text = f"Mathematical expression with {operator} operator"
-        
-        # Add sample-specific information
-        if 'image' in query and query['image']:
-            # Use image path as additional identifier
-            img_info = f"image_{os.path.basename(query['image'][0])}"
-            unique_text = f"{base_text} {img_info} sample_{sample_idx}"
-        else:
-            unique_text = f"{base_text} sample_{sample_idx}"
-        
-        return unique_text
-    
-    def process_single_sample(self, query: Dict, n_shot: int = 4, sample_idx: int = 0) -> Dict:
-        prompt, images = self.create_vlicl_prompt_and_images(query, n_shot)
-        
-        input_ids = self.tokenizer(prompt, return_tensors='pt')['input_ids']
-        token_positions = self.find_query_token_positions(input_ids)
+        for layer_idx in range(num_layers):
+            layer = language_model.model.layers[layer_idx]
+            hook = layer.register_forward_hook(create_hook(f"layer_{layer_idx}"))
+            hooks.append(hook)
         
         try:
-            self.register_hooks()
-            
             with torch.no_grad():
+                generation_config = dict(max_new_tokens=1, do_sample=False)
+                
                 if images:
-                    pixel_values = None
-                    num_patches_list = None
-                    
                     if len(images) == 1:
                         pixel_values = self.model.load_image(images[0], max_num=12).to(torch.bfloat16).cuda()
+                        num_patches_list = None
                     else:
                         pixel_values_list = []
                         num_patches_list = []
@@ -227,8 +116,6 @@ class VLICLHiddenStatesExtractor:
                             pixel_values_list.append(img_pixel_values)
                             num_patches_list.append(img_pixel_values.size(0))
                         pixel_values = torch.cat(pixel_values_list, dim=0).to(torch.bfloat16).cuda()
-                    
-                    generation_config = dict(max_new_tokens=1, do_sample=False)
                     
                     if num_patches_list is not None:
                         response = self.model.model.chat(
@@ -240,72 +127,159 @@ class VLICLHiddenStatesExtractor:
                             self.tokenizer, pixel_values, prompt, generation_config
                         )
                 else:
-                    inputs = self.tokenizer(prompt, return_tensors='pt')
-                    inputs = {k: v.to(next(self.model.model.parameters()).device) for k, v in inputs.items()}
-                    outputs = self.model.model(**inputs)
-            
-            results = {}
-            
-            if token_positions['query_forerunner'] is not None:
-                results['query_forerunner'] = self.extract_hidden_states_at_position(token_positions['query_forerunner'])
-            
-            if token_positions['last_input_text'] is not None:
-                results['last_input_text'] = self.extract_hidden_states_at_position(token_positions['last_input_text'])
-            
-            if token_positions['query_label'] is not None:
-                results['query_label'] = self.extract_hidden_states_at_position(token_positions['query_label'])
-            
-            # Create unique BGE reference embedding for this specific sample
-            query_identifier = self.create_unique_query_identifier(query, sample_idx)
-            results['bge_reference'] = self.get_bge_reference_embedding(query_identifier)
-            
-            results['sample_info'] = {
+                    response = self.model.model.chat(
+                        self.tokenizer, None, prompt, generation_config
+                    )
+        
+        finally:
+            for hook in hooks:
+                hook.remove()
+        
+        extracted_reps = {}
+        for pos_name, pos in target_positions.items():
+            layer_reps = []
+            for layer_idx in range(num_layers):
+                layer_name = f"layer_{layer_idx}"
+                if layer_name in layer_outputs:
+                    hidden_states = layer_outputs[layer_name]
+                    if hidden_states.dim() == 3 and 0 <= pos < hidden_states.shape[1]:
+                        rep = hidden_states[0, pos, :].numpy()
+                        layer_reps.append(rep)
+                    else:
+                        layer_reps.append(np.zeros(3584))
+                else:
+                    layer_reps.append(np.zeros(3584))
+            extracted_reps[pos_name] = layer_reps
+        
+        return extracted_reps
+    
+    def get_bge_reference_embedding(self, query_identifier: str):
+        if self.bge_model is None:
+            self.load_bge_model()
+        
+        inputs = self.bge_tokenizer(query_identifier, return_tensors='pt', truncation=True, max_length=512)
+        inputs = {k: v.cuda() for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = self.bge_model(**inputs)
+            embedding_tensor = outputs.last_hidden_state[:, 0, :].squeeze().cpu()
+            if embedding_tensor.dtype == torch.bfloat16:
+                embedding_tensor = embedding_tensor.float()
+            embedding = embedding_tensor.numpy()
+        
+        return embedding
+    
+    def create_unique_query_identifier(self, query: Dict, sample_idx: int):
+        operator = query.get('operator', 'unknown')
+        base_text = f"Mathematical expression with {operator} operator"
+        
+        if 'image' in query and query['image']:
+            img_info = f"image_{os.path.basename(query['image'][0])}"
+            unique_text = f"{base_text} {img_info} sample_{sample_idx}"
+        else:
+            unique_text = f"{base_text} sample_{sample_idx}"
+        
+        return unique_text
+    
+    def process_single_sample(self, query: Dict, n_shot: int = 4, sample_idx: int = 0):
+        prompt, images = self.create_vlicl_prompt_and_images(query, n_shot)
+        
+        answer_positions, colon_positions, text_len = self.find_answer_positions(prompt)
+        
+        if not answer_positions:
+            raise ValueError(f"No answer positions found in sample {sample_idx}")
+        
+        last_answer_pos = answer_positions[-1]
+        
+        query_forerunner_pos = None
+        for colon_pos in colon_positions:
+            if colon_pos > last_answer_pos:
+                query_forerunner_pos = colon_pos
+                break
+        
+        if query_forerunner_pos is None:
+            query_forerunner_pos = last_answer_pos + 1
+        
+        target_positions = {
+            'query_forerunner': query_forerunner_pos,
+            'last_input_text': last_answer_pos - 1 if last_answer_pos > 0 else 0,
+            'query_label': query_forerunner_pos + 1 if query_forerunner_pos + 1 < text_len else query_forerunner_pos
+        }
+        
+        extracted_reps = self.extract_representations(prompt, images, target_positions)
+        
+        query_identifier = self.create_unique_query_identifier(query, sample_idx)
+        bge_reference = self.get_bge_reference_embedding(query_identifier)
+        
+        results = {
+            'query_forerunner': extracted_reps['query_forerunner'],
+            'last_input_text': extracted_reps['last_input_text'],
+            'query_label': extracted_reps['query_label'],
+            'bge_reference': bge_reference,
+            'sample_info': {
                 'operator': query.get('operator', 'unknown'),
                 'n_shot': n_shot,
                 'num_images': len(images),
                 'sample_idx': sample_idx,
-                'query_identifier': query_identifier
+                'query_identifier': query_identifier,
+                'target_positions': target_positions
             }
-            
-            return results
-            
-        finally:
-            self.remove_hooks()
-            self.hidden_states.clear()
-            torch.cuda.empty_cache()
+        }
+        
+        return results
     
-    def debug_sample_diversity(self, results: Dict, k: int, num_debug_samples: int = 5):
-        """Debug function to check if samples are actually diverse"""
-        print(f"\n=== DEBUGGING SAMPLE DIVERSITY FOR k={k} ===")
+    def validate_final_results(self, complete_results: Dict):
+        print(f"\n{'='*60}")
+        print("FINAL VALIDATION")
+        print(f"{'='*60}")
         
-        if 'query_forerunner' not in results or not results['query_forerunner']:
-            print("No query_forerunner data found")
-            return
+        # Test k=0 and k=4 if available
+        test_k_values = [k for k in [0, 4] if k in complete_results['data']]
         
-        # Check BGE reference diversity
-        bge_refs = results['bge_reference'][:num_debug_samples]
-        print(f"\nBGE Reference Embeddings diversity:")
-        for i in range(len(bge_refs)):
-            for j in range(i+1, len(bge_refs)):
-                cos_sim = np.dot(bge_refs[i], bge_refs[j]) / (np.linalg.norm(bge_refs[i]) * np.linalg.norm(bge_refs[j]))
-                print(f"  BGE sample {i} vs {j}: cosine_sim = {cos_sim:.4f}")
-        
-        # Check hidden states diversity (just layer 0 and layer 15)
-        forerunner_states = results['query_forerunner'][:num_debug_samples]
-        for layer_idx in [0, 15]:
-            if layer_idx < len(forerunner_states[0]):
-                print(f"\nHidden states diversity at layer {layer_idx}:")
-                layer_states = [sample[layer_idx] for sample in forerunner_states]
-                for i in range(len(layer_states)):
-                    for j in range(i+1, len(layer_states)):
-                        cos_sim = np.dot(layer_states[i], layer_states[j]) / (np.linalg.norm(layer_states[i]) * np.linalg.norm(layer_states[j]))
-                        print(f"  Hidden sample {i} vs {j}: cosine_sim = {cos_sim:.4f}")
-        
-        # Check sample info diversity
-        sample_infos = results['sample_info'][:num_debug_samples]
-        print(f"\nSample info:")
-        for i, info in enumerate(sample_infos):
-            print(f"  Sample {i}: operator={info.get('operator')}, identifier='{info.get('query_identifier', '')[:50]}...'")
+        for k in test_k_values:
+            results = complete_results['data'][k]
+            
+            if not results['query_forerunner'] or len(results['query_forerunner']) < 2:
+                continue
+                
+            print(f"\nk={k}:")
+            
+            # Within-sample token diversity (first sample)
+            sample_0_forerunner = results['query_forerunner'][0][0]  # layer 0
+            sample_0_last_input = results['last_input_text'][0][0]   
+            sample_0_label = results['query_label'][0][0]
+            
+            within_sim_1 = np.dot(sample_0_forerunner, sample_0_last_input) / (np.linalg.norm(sample_0_forerunner) * np.linalg.norm(sample_0_last_input))
+            within_sim_2 = np.dot(sample_0_forerunner, sample_0_label) / (np.linalg.norm(sample_0_forerunner) * np.linalg.norm(sample_0_label))
+            
+            print(f"  Within-sample diversity (layer 0):")
+            print(f"    forerunner vs last_input: {within_sim_1:.4f}")
+            print(f"    forerunner vs label: {within_sim_2:.4f}")
+            
+            # Cross-sample diversity 
+            num_test = min(5, len(results['query_forerunner']))
+            cross_sims = []
+            
+            for i in range(num_test):
+                for j in range(i+1, num_test):
+                    rep_i = results['query_forerunner'][i][0]  # layer 0
+                    rep_j = results['query_forerunner'][j][0]
+                    cos_sim = np.dot(rep_i, rep_j) / (np.linalg.norm(rep_i) * np.linalg.norm(rep_j))
+                    cross_sims.append(cos_sim)
+            
+            if cross_sims:
+                avg_cross_sim = np.mean(cross_sims)
+                max_cross_sim = np.max(cross_sims)
+                print(f"  Cross-sample diversity (layer 0):")
+                print(f"    average similarity: {avg_cross_sim:.4f}")
+                print(f"    max similarity: {max_cross_sim:.4f}")
+                
+                if k == 0:
+                    print(f"    (k=0: high similarity expected for same image files)")
+                elif avg_cross_sim < 0.95:
+                    print(f"    ✅ Good diversity")
+                else:
+                    print(f"    ⚠️  High similarity")
     
     def extract_complete_dataset(self, num_samples: int = 100, k_values: List[int] = [0, 1, 2, 4, 8], save_path: str = "vlicl_hidden_states.pkl"):
         if self.model is None:
@@ -320,13 +294,15 @@ class VLICLHiddenStatesExtractor:
                 'data_dir': self.data_dir,
                 'num_samples': len(query_samples),
                 'k_values': k_values,
-                'task': 'operator_induction'
+                'task': 'operator_induction',
+                'base_instruction': self.base_instruction,
+                'extraction_method': 'verified_working_method'
             },
             'data': {}
         }
         
         for k in k_values:
-            print(f"\nProcessing k={k} demonstrations...")
+            print(f"\nProcessing k={k}...")
             
             k_results = {
                 'query_forerunner': [],
@@ -341,53 +317,38 @@ class VLICLHiddenStatesExtractor:
                     sample_results = self.process_single_sample(query, k, sample_idx=i)
                     
                     for key in ['query_forerunner', 'last_input_text', 'query_label', 'bge_reference', 'sample_info']:
-                        if key in sample_results:
-                            k_results[key].append(sample_results[key])
-                        else:
-                            print(f"Warning: {key} not found in sample {i} for k={k}")
+                        k_results[key].append(sample_results[key])
                     
                 except Exception as e:
                     print(f"Error processing sample {i} for k={k}: {e}")
                     continue
             
-            # Debug sample diversity for first k value
-            if k == k_values[0]:
-                self.debug_sample_diversity(k_results, k)
-            
             complete_results['data'][k] = k_results
             print(f"k={k} completed: {len(k_results['query_forerunner'])} samples")
         
+        # Final validation
+        self.validate_final_results(complete_results)
+        
+        # Save results
         save_dir = os.path.dirname(save_path)
         if save_dir:
             os.makedirs(save_dir, exist_ok=True)
         
-        print(f"\nSaving complete results to {save_path}...")
+        print(f"\nSaving results to {save_path}...")
         with open(save_path, 'wb') as f:
             pickle.dump(complete_results, f)
         
-        print(f"Extraction complete! Saved to {save_path}")
-        self.print_extraction_summary(complete_results)
+        print("✅ Extraction complete!")
         
-        return complete_results
-    
-    def print_extraction_summary(self, results: Dict):
-        print(f"\n{'='*60}")
-        print("EXTRACTION SUMMARY")
-        print(f"{'='*60}")
-        
-        info = results['extraction_info']
-        print(f"Model: {info['model_name']}")
-        print(f"Task: {info['task']}")
-        print(f"Total samples: {info['num_samples']}")
-        print(f"K values: {info['k_values']}")
-        
-        print(f"\nExtracted data structure:")
-        for k, k_data in results['data'].items():
+        print(f"\nFinal data structure:")
+        for k, k_data in complete_results['data'].items():
             if k_data['query_forerunner']:
                 n_samples = len(k_data['query_forerunner'])
                 n_layers = len(k_data['query_forerunner'][0])
                 hidden_dim = k_data['query_forerunner'][0][0].shape[0]
                 print(f"  k={k}: {n_samples} samples × {n_layers} layers × {hidden_dim} dims")
+        
+        return complete_results
 
 def main():
     import argparse
@@ -395,36 +356,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="./VL-ICL", help="VL-ICL data directory")
     parser.add_argument("--model_name", type=str, default="OpenGVLab/InternVL3-8B-Instruct", help="Model name")
-    parser.add_argument("--num_samples", type=int, default=100, help="Number of samples to process")
+    parser.add_argument("--num_samples", type=int, default=60, help="Number of samples to process")
     parser.add_argument("--k_values", nargs="+", type=int, default=[0, 1, 2, 4, 8], help="K values to process")
-    parser.add_argument("--save_path", type=str, default="./data/vlicl_hidden_states.pkl", help="Save path for results")
-    parser.add_argument("--debug_only", action="store_true", help="Only run token position debugging")
+    parser.add_argument("--save_path", type=str, default="./data/vlicl_hidden_states_final.pkl", help="Save path for results")
     
     args = parser.parse_args()
     
     extractor = VLICLHiddenStatesExtractor(args.model_name, args.data_dir)
-    
-    if args.debug_only:
-        extractor.load_model()
-        print("Running token position debugging only...")
-        
-        query = extractor.task.query_data[0]
-        prompt, images = extractor.create_vlicl_prompt_and_images(query, 4)
-        
-        print(f"Sample operator: {query.get('operator', 'unknown')}")
-        print(f"Images: {len(images)}")
-        print(f"Prompt (last 300 chars): ...{prompt[-300:]}")
-        
-        input_ids = extractor.tokenizer(prompt, return_tensors='pt')['input_ids']
-        positions = extractor.find_query_token_positions(input_ids)
-        print(f"Token positions: {positions}")
-    else:
-        print("Running complete extraction...")
-        results = extractor.extract_complete_dataset(
-            num_samples=args.num_samples,
-            k_values=args.k_values,
-            save_path=args.save_path
-        )
+    results = extractor.extract_complete_dataset(
+        num_samples=args.num_samples,
+        k_values=args.k_values,
+        save_path=args.save_path
+    )
 
 if __name__ == "__main__":
     main()
