@@ -3,6 +3,7 @@ import sys
 import torch
 import numpy as np
 import pickle
+import gc
 from typing import List, Dict, Tuple
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel
@@ -77,7 +78,7 @@ class VLICLHiddenStatesExtractor:
         
         return answer_positions, colon_positions, len(tokens)
     
-    def extract_representations(self, prompt: str, images: List, target_positions: List[int]):
+    def extract_representations(self, prompt: str, images: List, target_positions: Dict):
         layer_outputs = {}
         hooks = []
         
@@ -89,6 +90,7 @@ class VLICLHiddenStatesExtractor:
                     hidden_states = output
                 if hidden_states.dtype == torch.bfloat16:
                     hidden_states = hidden_states.float()
+                # MEMORY OPTIMIZATION: Only keep what we need, move to CPU immediately
                 layer_outputs[layer_name] = hidden_states.detach().cpu()
             return hook_fn
         
@@ -130,11 +132,15 @@ class VLICLHiddenStatesExtractor:
                     response = self.model.model.chat(
                         self.tokenizer, None, prompt, generation_config
                     )
+                
+                # MEMORY OPTIMIZATION: Clear GPU cache after forward pass
+                torch.cuda.empty_cache()
         
         finally:
             for hook in hooks:
                 hook.remove()
         
+        # Extract specific positions and convert to numpy
         extracted_reps = {}
         for pos_name, pos in target_positions.items():
             layer_reps = []
@@ -146,10 +152,39 @@ class VLICLHiddenStatesExtractor:
                         rep = hidden_states[0, pos, :].numpy()
                         layer_reps.append(rep)
                     else:
-                        layer_reps.append(np.zeros(3584))
+                        # Get hidden dimension from first valid layer
+                        if layer_idx == 0 and hidden_states.dim() == 3:
+                            hidden_dim = hidden_states.shape[-1]
+                        else:
+                            hidden_dim = 3584  # fallback
+                        layer_reps.append(np.zeros(hidden_dim))
                 else:
                     layer_reps.append(np.zeros(3584))
             extracted_reps[pos_name] = layer_reps
+        
+        # Add mean-pooling across tokens for each layer
+        mean_pooling_reps = []
+        for layer_idx in range(num_layers):
+            layer_name = f"layer_{layer_idx}"
+            if layer_name in layer_outputs:
+                hidden_states = layer_outputs[layer_name]
+                if hidden_states.dim() == 3:
+                    mean_pooled = torch.mean(hidden_states[0], dim=0).numpy()
+                    mean_pooling_reps.append(mean_pooled)
+                else:
+                    if layer_idx == 0 and hidden_states.dim() == 3:
+                        hidden_dim = hidden_states.shape[-1]
+                    else:
+                        hidden_dim = 3584  # fallback
+                    mean_pooling_reps.append(np.zeros(hidden_dim))
+            else:
+                mean_pooling_reps.append(np.zeros(3584))
+        
+        extracted_reps['mean_pooling'] = mean_pooling_reps
+        
+        layer_outputs.clear()
+        del layer_outputs
+        gc.collect()
         
         return extracted_reps
     
@@ -167,7 +202,40 @@ class VLICLHiddenStatesExtractor:
                 embedding_tensor = embedding_tensor.float()
             embedding = embedding_tensor.numpy()
         
+        # MEMORY OPTIMIZATION: Clear BGE inputs
+        del inputs, outputs, embedding_tensor
+        torch.cuda.empty_cache()
+        
         return embedding
+    
+    def get_bge_token_embeddings(self):
+        """Get BGE embeddings for the three critical token types"""
+        if self.bge_model is None:
+            self.load_bge_model()
+        
+        token_texts = {
+            'forerunner': "mathematical operator forerunner token",
+            'last_input': "last input text token", 
+            'label': "result label token"
+        }
+        
+        token_embeddings = {}
+        for token_name, token_text in token_texts.items():
+            inputs = self.bge_tokenizer(token_text, return_tensors='pt', truncation=True, max_length=512)
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+            
+            with torch.no_grad():
+                outputs = self.bge_model(**inputs)
+                embedding_tensor = outputs.last_hidden_state[:, 0, :].squeeze().cpu()
+                if embedding_tensor.dtype == torch.bfloat16:
+                    embedding_tensor = embedding_tensor.float()
+                token_embeddings[token_name] = embedding_tensor.numpy()
+            
+            # MEMORY OPTIMIZATION: Clear intermediate tensors
+            del inputs, outputs, embedding_tensor
+        
+        torch.cuda.empty_cache()
+        return token_embeddings
     
     def create_unique_query_identifier(self, query: Dict, sample_idx: int):
         operator = query.get('operator', 'unknown')
@@ -210,12 +278,15 @@ class VLICLHiddenStatesExtractor:
         
         query_identifier = self.create_unique_query_identifier(query, sample_idx)
         bge_reference = self.get_bge_reference_embedding(query_identifier)
+        bge_token_embeddings = self.get_bge_token_embeddings()
         
         results = {
             'query_forerunner': extracted_reps['query_forerunner'],
             'last_input_text': extracted_reps['last_input_text'],
             'query_label': extracted_reps['query_label'],
+            'mean_pooling': extracted_reps['mean_pooling'],
             'bge_reference': bge_reference,
+            'bge_token_embeddings': bge_token_embeddings,
             'sample_info': {
                 'operator': query.get('operator', 'unknown'),
                 'n_shot': n_shot,
@@ -226,6 +297,9 @@ class VLICLHiddenStatesExtractor:
             }
         }
         
+        del extracted_reps
+        gc.collect()
+        
         return results
     
     def validate_final_results(self, complete_results: Dict):
@@ -233,7 +307,6 @@ class VLICLHiddenStatesExtractor:
         print("FINAL VALIDATION")
         print(f"{'='*60}")
         
-        # Test k=0 and k=4 if available
         test_k_values = [k for k in [0, 4] if k in complete_results['data']]
         
         for k in test_k_values:
@@ -244,25 +317,32 @@ class VLICLHiddenStatesExtractor:
                 
             print(f"\nk={k}:")
             
-            # Within-sample token diversity (first sample)
-            sample_0_forerunner = results['query_forerunner'][0][0]  # layer 0
+            sample_0_forerunner = results['query_forerunner'][0][0]
             sample_0_last_input = results['last_input_text'][0][0]   
             sample_0_label = results['query_label'][0][0]
+            sample_0_mean_pool = results['mean_pooling'][0][0]
             
             within_sim_1 = np.dot(sample_0_forerunner, sample_0_last_input) / (np.linalg.norm(sample_0_forerunner) * np.linalg.norm(sample_0_last_input))
             within_sim_2 = np.dot(sample_0_forerunner, sample_0_label) / (np.linalg.norm(sample_0_forerunner) * np.linalg.norm(sample_0_label))
+            within_sim_3 = np.dot(sample_0_forerunner, sample_0_mean_pool) / (np.linalg.norm(sample_0_forerunner) * np.linalg.norm(sample_0_mean_pool))
             
             print(f"  Within-sample diversity (layer 0):")
             print(f"    forerunner vs last_input: {within_sim_1:.4f}")
             print(f"    forerunner vs label: {within_sim_2:.4f}")
+            print(f"    forerunner vs mean_pooling: {within_sim_3:.4f}")
             
-            # Cross-sample diversity 
+            print(f"  Dimensions:")
+            print(f"    forerunner: {sample_0_forerunner.shape}")
+            print(f"    mean_pooling: {sample_0_mean_pool.shape}")
+            print(f"    bge_reference: {results['bge_reference'][0].shape}")
+            print(f"    bge_token_embeddings: {results['bge_token_embeddings'][0]['forerunner'].shape}")
+            
             num_test = min(5, len(results['query_forerunner']))
             cross_sims = []
             
             for i in range(num_test):
                 for j in range(i+1, num_test):
-                    rep_i = results['query_forerunner'][i][0]  # layer 0
+                    rep_i = results['query_forerunner'][i][0]
                     rep_j = results['query_forerunner'][j][0]
                     cos_sim = np.dot(rep_i, rep_j) / (np.linalg.norm(rep_i) * np.linalg.norm(rep_j))
                     cross_sims.append(cos_sim)
@@ -296,19 +376,22 @@ class VLICLHiddenStatesExtractor:
                 'k_values': k_values,
                 'task': 'operator_induction',
                 'base_instruction': self.base_instruction,
-                'extraction_method': 'verified_working_method'
+                'extraction_method': 'memory_optimized_version'
             },
             'data': {}
         }
         
         for k in k_values:
             print(f"\nProcessing k={k}...")
+            print(f"GPU Memory before k={k}: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
             
             k_results = {
                 'query_forerunner': [],
                 'last_input_text': [],
                 'query_label': [],
+                'mean_pooling': [],
                 'bge_reference': [],
+                'bge_token_embeddings': [],
                 'sample_info': []
             }
             
@@ -316,20 +399,31 @@ class VLICLHiddenStatesExtractor:
                 try:
                     sample_results = self.process_single_sample(query, k, sample_idx=i)
                     
-                    for key in ['query_forerunner', 'last_input_text', 'query_label', 'bge_reference', 'sample_info']:
+                    for key in ['query_forerunner', 'last_input_text', 'query_label', 'mean_pooling', 'bge_reference', 'bge_token_embeddings', 'sample_info']:
                         k_results[key].append(sample_results[key])
+                    
+                    del sample_results
+                    
+                    if (i + 1) % 10 == 0:
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        print(f"  Sample {i+1}/{len(query_samples)}: GPU Memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
                     
                 except Exception as e:
                     print(f"Error processing sample {i} for k={k}: {e}")
+                    torch.cuda.empty_cache()
+                    gc.collect()
                     continue
             
             complete_results['data'][k] = k_results
             print(f"k={k} completed: {len(k_results['query_forerunner'])} samples")
+            
+            gc.collect()
+            torch.cuda.empty_cache()
+            print(f"GPU Memory after k={k}: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
         
-        # Final validation
         self.validate_final_results(complete_results)
         
-        # Save results
         save_dir = os.path.dirname(save_path)
         if save_dir:
             os.makedirs(save_dir, exist_ok=True)
@@ -339,7 +433,6 @@ class VLICLHiddenStatesExtractor:
             pickle.dump(complete_results, f)
         
         print("✅ Extraction complete!")
-        
         print(f"\nFinal data structure:")
         for k, k_data in complete_results['data'].items():
             if k_data['query_forerunner']:
@@ -347,6 +440,8 @@ class VLICLHiddenStatesExtractor:
                 n_layers = len(k_data['query_forerunner'][0])
                 hidden_dim = k_data['query_forerunner'][0][0].shape[0]
                 print(f"  k={k}: {n_samples} samples × {n_layers} layers × {hidden_dim} dims")
+                print(f"    + mean_pooling: {n_samples} samples × {n_layers} layers × {hidden_dim} dims")
+                print(f"    + bge_token_embeddings: 3 token types × 1024 dims")
         
         return complete_results
 
@@ -355,10 +450,10 @@ def main():
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="./VL-ICL", help="VL-ICL data directory")
-    parser.add_argument("--model_name", type=str, default="OpenGVLab/InternVL3-8B-Instruct", help="Model name")
+    parser.add_argument("--model_name", type=str, default="OpenGVLab/InternVL3-38B-Instruct", help="Model name")
     parser.add_argument("--num_samples", type=int, default=60, help="Number of samples to process")
-    parser.add_argument("--k_values", nargs="+", type=int, default=[0, 1, 2, 4, 8], help="K values to process")
-    parser.add_argument("--save_path", type=str, default="./data/vlicl_hidden_states_final.pkl", help="Save path for results")
+    parser.add_argument("--k_values", nargs="+", type=int, default=[0, 1, 2, 4], help="K values to process")
+    parser.add_argument("--save_path", type=str, default="./data/InternVL3-38B-Instruct/vlicl_hidden_states_final.pkl", help="Save path for results")
     
     args = parser.parse_args()
     
