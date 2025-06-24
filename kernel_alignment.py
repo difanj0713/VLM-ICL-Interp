@@ -1,265 +1,349 @@
-#!/usr/bin/env python3
 import numpy as np
-import pickle
 import matplotlib.pyplot as plt
-import os
-from typing import List, Dict, Tuple
+import pickle
 from tqdm import tqdm
+from typing import Dict, List, Tuple
+import os
 
-class KernelAlignmentAnalyzer:
-    def __init__(self, k_neighbors: int = 16):
-        self.k_neighbors = k_neighbors
-        # Random baseline = k/n
+class VLICLKernelAlignment:
+    def __init__(self, data_path: str):
+        self.data_path = data_path
+        self.data = None
+        self.load_data()
     
-    def sim_graph(self, features: List[np.ndarray]) -> List[List[float]]:
-        """Calculate similarity graph using cosine similarity"""
-        simGraph = []
-        for i in tqdm(range(len(features)), desc="Computing similarity graph"):
-            line = []
-            for j in range(len(features)):
+    def load_data(self):
+        with open(self.data_path, 'rb') as f:
+            self.data = pickle.load(f)
+        print(f"Loaded data from {self.data_path}")
+        print(f"Available k values: {list(self.data['data'].keys())}")
+        
+        for k, k_data in self.data['data'].items():
+            if k_data['query_forerunner']:
+                n_samples = len(k_data['query_forerunner'])
+                n_layers = len(k_data['query_forerunner'][0])
+                print(f"k={k}: {n_samples} samples, {n_layers} layers")
+    
+    def sim_graph(self, representations: List[np.ndarray]) -> np.ndarray:
+        n = len(representations)
+        similarity_matrix = np.zeros((n, n))
+        
+        for i in range(n):
+            for j in range(n):
                 if i == j:
-                    line.append(0)  # Set diagonal to 0 as per paper
+                    similarity_matrix[i, j] = 1.0
                 else:
-                    dot_product = np.dot(features[i], features[j])
-                    norm_i = np.linalg.norm(features[i])
-                    norm_j = np.linalg.norm(features[j])
+                    norm_i = np.linalg.norm(representations[i])
+                    norm_j = np.linalg.norm(representations[j])
                     if norm_i > 0 and norm_j > 0:
-                        cos_sim = dot_product / (norm_i * norm_j)
+                        similarity_matrix[i, j] = np.dot(representations[i], representations[j]) / (norm_i * norm_j)
                     else:
-                        cos_sim = 0.0
-                    line.append(cos_sim)
-            simGraph.append(line)
-        return simGraph
+                        similarity_matrix[i, j] = 0.0
+        
+        return similarity_matrix
     
-    def kernel_alignment(self, simGraph_1: List[List[float]], simGraph_2: List[List[float]], k: int = None) -> Tuple[float, float, List[float]]:
-        """Calculate mutual nearest-neighbor kernel alignment"""
-        if k is None:
-            k = self.k_neighbors
-        
+    def overlap(self, list1: List, list2: List) -> int:
+        return len(set(list1).intersection(set(list2)))
+    
+    def kernel_alignment(self, simGraph_1: np.ndarray, simGraph_2: np.ndarray, k: int = 8) -> Tuple[float, float, List[float]]:
         n = len(simGraph_1)
-        k = min(k, n - 1)  # Ensure k doesn't exceed available neighbors
+        k = min(k, n-1)
         
-        # Similar to their repo
         aligns = []
         for i in range(n):
             top_k_1 = np.argsort(simGraph_1[i])[::-1][:k]
             top_k_2 = np.argsort(simGraph_2[i])[::-1][:k]
             
-            overlap = len(set(top_k_1.tolist()) & set(top_k_2.tolist()))
-            aligns.append(overlap / k)
+            overlap_count = self.overlap(top_k_1.tolist(), top_k_2.tolist())
+            aligns.append(overlap_count / k)
         
         return np.mean(aligns), np.std(aligns), aligns
     
-    def average_cosine_similarity(self, features1: List[np.ndarray], features2: List[np.ndarray]) -> float:
+    def cosine_similarity_analysis(self, representations_1: List[np.ndarray], representations_2: List[np.ndarray]) -> Tuple[float, float, List[float]]:
         similarities = []
-        for f1, f2 in zip(features1, features2):
-            cos_sim = np.dot(f1, f2) / (np.linalg.norm(f1) * np.linalg.norm(f2))
-            similarities.append(cos_sim)
-        return np.mean(similarities)
-    
-    def analyze_token_types(self, k4_data: Dict) -> Dict:
-        print("Analyzing token type comparison...")
         
-        query_forerunner_states = k4_data['query_forerunner']
-        last_input_text_states = k4_data['last_input_text'] 
-        query_label_states = k4_data['query_label']
-        mean_pooling_states = k4_data['mean_pooling']
-        bge_references = k4_data['bge_reference']
+        for rep1, rep2 in zip(representations_1, representations_2):
+            norm1 = np.linalg.norm(rep1)
+            norm2 = np.linalg.norm(rep2)
+            
+            if norm1 > 0 and norm2 > 0:
+                cosine_sim = np.dot(rep1, rep2) / (norm1 * norm2)
+                similarities.append(cosine_sim)
+            else:
+                similarities.append(0.0)
+        
+        return np.mean(similarities), np.std(similarities), similarities
+    
+    def analyze_token_type_comparison(self, k: int = 4) -> Dict:
+        print(f"Analyzing token type comparison (k={k})...")
+        
+        if k not in self.data['data']:
+            raise ValueError(f"k={k} not found in data")
+        
+        k_data = self.data['data'][k]
+        
+        query_forerunner_states = k_data['query_forerunner']
+        last_input_text_states = k_data['last_input_text'] 
+        query_label_states = k_data['query_label']
+        query_mean_pooled_states = k_data['query_mean_pooled']
+        
+        if not query_forerunner_states:
+            print("No data available for analysis")
+            return {}
         
         n_layers = len(query_forerunner_states[0])
         n_samples = len(query_forerunner_states)
+        print(f"Analyzing {n_layers} layers, {n_samples} samples")
         
-        print(f"Processing {n_samples} samples, {n_layers} layers")
-        print(f"Using k_neighbors = {self.k_neighbors}")
-        print(f"Random baseline = {self.k_neighbors}/{n_samples} = {self.k_neighbors/n_samples:.4f}")
-        
-        # Calculate BGE reference similarity graph (FIXED - same for all layers)
-        print("Computing BGE reference similarity graph...")
-        bge_sim_graph = self.sim_graph(bge_references)
-        
-        results = {
-            'forerunner': {'cosine_vs_mean_pool': [], 'kernel_align_vs_bge': []},
-            'last_input_text': {'cosine_vs_mean_pool': [], 'kernel_align_vs_bge': []},
-            'label': {'cosine_vs_mean_pool': [], 'kernel_align_vs_bge': []}
+        comparison_results = {
+            'query_forerunner': {'kernel_alignments': [], 'cosine_similarities': []},
+            'last_input_text': {'kernel_alignments': [], 'cosine_similarities': []},
+            'query_label': {'kernel_alignments': [], 'cosine_similarities': []}
         }
         
-        for layer_idx in tqdm(range(n_layers), desc="Processing layers"):
-            layer_features = {
-                'forerunner': [query_forerunner_states[i][layer_idx] for i in range(n_samples)],
-                'last_input_text': [last_input_text_states[i][layer_idx] for i in range(n_samples)],
-                'label': [query_label_states[i][layer_idx] for i in range(n_samples)]
-            }
+        for token_type in ['query_forerunner', 'last_input_text', 'query_label']:
+            print(f"Processing {token_type}...")
+            token_states = k_data[token_type]
             
-            mean_pool_layer = [mean_pooling_states[i][layer_idx] for i in range(n_samples)]
-            
-            for token_type, features in layer_features.items():
-                # Same-dimension cosine similarity
-                cos_vs_mean = self.average_cosine_similarity(features, mean_pool_layer)
-                results[token_type]['cosine_vs_mean_pool'].append(cos_vs_mean)
+            for layer_idx in tqdm(range(n_layers), desc=f"{token_type} layers"):
+                layer_states = [sample_states[layer_idx] for sample_states in token_states]
+                query_layer_states = [sample_states[layer_idx] for sample_states in query_mean_pooled_states]
                 
-                token_sim_graph = self.sim_graph(features)
-                ka_vs_bge, _, _ = self.kernel_alignment(token_sim_graph, bge_sim_graph, k=self.k_neighbors)
-                results[token_type]['kernel_align_vs_bge'].append(ka_vs_bge)
+                layer_sim_graph = self.sim_graph(layer_states)
+                query_sim_graph = self.sim_graph(query_layer_states)
                 
-                if layer_idx == 0:
-                    print(f"Layer 0 - {token_type}: kernel_align={ka_vs_bge:.4f}")
+                mean_align, std_align, individual_aligns = self.kernel_alignment(layer_sim_graph, query_sim_graph)
+                comparison_results[token_type]['kernel_alignments'].append((mean_align, std_align, individual_aligns))
+                
+                mean_cosine, std_cosine, individual_cosines = self.cosine_similarity_analysis(layer_states, query_layer_states)
+                comparison_results[token_type]['cosine_similarities'].append((mean_cosine, std_cosine, individual_cosines))
         
-        return results
+        return comparison_results
     
-    def analyze_k_values(self, complete_data: Dict) -> Dict:
-        print("Analyzing k value comparison...")
+    def analyze_different_k_values(self) -> Dict:
+        print("Analyzing different k values (query_forerunner only)...")
         
-        results = {}
+        k_analysis_results = {}
         
-        for k in complete_data['data'].keys():
-            k_data = complete_data['data'][k]
-            if not k_data['query_forerunner'] or not k_data['bge_reference']:
-                continue
-                
-            print(f"Processing k={k}")
+        for k, k_data in self.data['data'].items():
+            print(f"Processing k={k}...")
             
             query_forerunner_states = k_data['query_forerunner']
-            mean_pooling_states = k_data['mean_pooling']
-            bge_references = k_data['bge_reference']
+            query_mean_pooled_states = k_data['query_mean_pooled']
+            
+            if not query_forerunner_states:
+                print(f"No data for k={k}")
+                continue
             
             n_layers = len(query_forerunner_states[0])
             n_samples = len(query_forerunner_states)
             
-            # DEBUG: Check if BGE references are actually different
-            if k == 0:
-                bge_sims = []
-                for i in range(min(5, n_samples)):
-                    for j in range(i+1, min(5, n_samples)):
-                        cos_sim = np.dot(bge_references[i], bge_references[j]) / (np.linalg.norm(bge_references[i]) * np.linalg.norm(bge_references[j]))
-                        bge_sims.append(cos_sim)
-                print(f"  BGE diversity check (k={k}): mean_sim={np.mean(bge_sims):.4f}, std={np.std(bge_sims):.4f}")
+            print(f"k={k}: {n_layers} layers, {n_samples} samples")
             
-            # Calculate BGE similarity graph (FIXED - same for all layers of this k)
-            bge_sim_graph = self.sim_graph(bge_references)
+            k_results = {'kernel_alignments': [], 'cosine_similarities': []}
             
-            cosine_vs_mean_pool = []
-            kernel_align_vs_bge = []
-            
-            for layer_idx in range(n_layers):
-                forerunner_features = [query_forerunner_states[i][layer_idx] for i in range(n_samples)]
-                mean_pool_layer = [mean_pooling_states[i][layer_idx] for i in range(n_samples)]
+            for layer_idx in tqdm(range(n_layers), desc=f"k={k} layers"):
+                layer_states = [sample_states[layer_idx] for sample_states in query_forerunner_states]
+                query_layer_states = [sample_states[layer_idx] for sample_states in query_mean_pooled_states]
                 
-                # Cosine similarity
-                cos_sim = self.average_cosine_similarity(forerunner_features, mean_pool_layer)
-                cosine_vs_mean_pool.append(cos_sim)
+                layer_sim_graph = self.sim_graph(layer_states)
+                query_sim_graph = self.sim_graph(query_layer_states)
                 
-                # Kernel alignment (compare with SAME BGE similarity graph for this k)
-                forerunner_sim_graph = self.sim_graph(forerunner_features)
-                ka_mean, _, _ = self.kernel_alignment(forerunner_sim_graph, bge_sim_graph, k=self.k_neighbors)
-                kernel_align_vs_bge.append(ka_mean)
+                mean_align, std_align, individual_aligns = self.kernel_alignment(layer_sim_graph, query_sim_graph)
+                k_results['kernel_alignments'].append((mean_align, std_align, individual_aligns))
+                
+                mean_cosine, std_cosine, individual_cosines = self.cosine_similarity_analysis(layer_states, query_layer_states)
+                k_results['cosine_similarities'].append((mean_cosine, std_cosine, individual_cosines))
             
-            results[k] = {
-                'cosine_vs_mean_pool': cosine_vs_mean_pool,
-                'kernel_align_vs_bge': kernel_align_vs_bge,
-                'n_samples': n_samples,
-                'random_baseline': self.k_neighbors / n_samples
-            }
+            k_analysis_results[k] = k_results
+        
+        return k_analysis_results
+    
+    def get_model_name(self) -> str:
+        if 'extraction_info' in self.data and 'model_name' in self.data['extraction_info']:
+            model_name = self.data['extraction_info']['model_name']
+            return model_name.split('/')[-1]
+        else:
+            return os.path.basename(self.data_path).split('_')[0]
+    
+    def plot_token_type_comparison(self, comparison_results: Dict):
+        model_name = self.get_model_name()
+        os.makedirs("./figs", exist_ok=True)
+        
+        colors = {
+            'query_forerunner': '#1f77b4',
+            'last_input_text': '#ff7f0e', 
+            'query_label': '#2ca02c'
+        }
+        
+        labels = {
+            'query_forerunner': 'Forerunner Token of Label',
+            'last_input_text': 'Last Token of Input Text',
+            'query_label': 'Label Token'
+        }
+        
+        n_layers = len(comparison_results['query_forerunner']['kernel_alignments'])
+        layer_indices = list(range(1, n_layers + 1))
+        
+        fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+        
+        for token_type, results in comparison_results.items():
+            kernel_means = [result[0] for result in results['kernel_alignments']]
+            ax.plot(layer_indices, kernel_means, color=colors[token_type], 
+                   label=labels[token_type], linewidth=2)
+        
+        random_baseline = 8 / len(comparison_results['query_forerunner']['kernel_alignments'][0][2])
+        ax.axhline(y=random_baseline, color='black', linestyle='--', linewidth=1, label='Random Baseline')
+        
+        ax.set_xlabel('Transformer Block Number')
+        ax.set_ylabel('Kernel Alignment')
+        ax.set_title(f'Token Type Comparison - Kernel Alignment ({model_name})')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        kernel_path = f"./figs/{model_name}_token_type_kernel_alignment.png"
+        plt.savefig(kernel_path, dpi=300, bbox_inches='tight')
+        print(f"Saved kernel alignment plot to {kernel_path}")
+        plt.close()
+        
+        fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+        
+        for token_type, results in comparison_results.items():
+            cosine_means = [result[0] for result in results['cosine_similarities']]
+            ax.plot(layer_indices, cosine_means, color=colors[token_type], 
+                   label=labels[token_type], linewidth=2)
+        
+        ax.axhline(y=0.0, color='black', linestyle='--', linewidth=1, label='Zero Baseline')
+        
+        ax.set_xlabel('Transformer Block Number')
+        ax.set_ylabel('Cosine Similarity')
+        ax.set_title(f'Token Type Comparison - Cosine Similarity ({model_name})')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        cosine_path = f"./figs/{model_name}_token_type_cosine_similarity.png"
+        plt.savefig(cosine_path, dpi=300, bbox_inches='tight')
+        print(f"Saved cosine similarity plot to {cosine_path}")
+        plt.close()
+    
+    def plot_k_value_comparison(self, k_analysis_results: Dict):
+        model_name = self.get_model_name()
+        os.makedirs("./figs", exist_ok=True)
+        
+        colors = plt.cm.viridis(np.linspace(0, 1, len(k_analysis_results)))
+        
+        fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+        
+        for i, (k, results) in enumerate(k_analysis_results.items()):
+            kernel_means = [result[0] for result in results['kernel_alignments']]
+            n_layers = len(kernel_means)
+            layer_indices = list(range(1, n_layers + 1))
             
-            print(f"k={k}: Layer 0 kernel_align={kernel_align_vs_bge[0]:.4f}, Random baseline={self.k_neighbors/n_samples:.4f}")
+            ax.plot(layer_indices, kernel_means, color=colors[i], 
+                   label=f'k={k}', linewidth=2)
+        
+        if k_analysis_results:
+            first_result = list(k_analysis_results.values())[0]
+            random_baseline = 8 / len(first_result['kernel_alignments'][0][2])
+            ax.axhline(y=random_baseline, color='black', linestyle='--', linewidth=1, label='Random Baseline')
+        
+        ax.set_xlabel('Transformer Block Number')
+        ax.set_ylabel('Kernel Alignment')
+        ax.set_title(f'K Value Comparison - Kernel Alignment ({model_name})')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        kernel_path = f"./figs/{model_name}_k_value_kernel_alignment.png"
+        plt.savefig(kernel_path, dpi=300, bbox_inches='tight')
+        print(f"Saved kernel alignment plot to {kernel_path}")
+        plt.close()
+        
+        fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+        
+        for i, (k, results) in enumerate(k_analysis_results.items()):
+            cosine_means = [result[0] for result in results['cosine_similarities']]
+            n_layers = len(cosine_means)
+            layer_indices = list(range(1, n_layers + 1))
+            
+            ax.plot(layer_indices, cosine_means, color=colors[i], 
+                   label=f'k={k}', linewidth=2)
+        
+        ax.axhline(y=0.0, color='black', linestyle='--', linewidth=1, label='Zero Baseline')
+        
+        ax.set_xlabel('Transformer Block Number')
+        ax.set_ylabel('Cosine Similarity')
+        ax.set_title(f'K Value Comparison - Cosine Similarity ({model_name})')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        cosine_path = f"./figs/{model_name}_k_value_cosine_similarity.png"
+        plt.savefig(cosine_path, dpi=300, bbox_inches='tight')
+        print(f"Saved cosine similarity plot to {cosine_path}")
+        plt.close()
+    
+    def run_complete_analysis(self, output_dir: str = "./analysis_results"):
+        os.makedirs(output_dir, exist_ok=True)
+        
+        print("="*60)
+        print("VL-ICL KERNEL ALIGNMENT ANALYSIS")
+        print("="*60)
+        
+        print("\n1. Token Type Comparison Analysis")
+        token_comparison = self.analyze_token_type_comparison(k=4)
+        self.plot_token_type_comparison(token_comparison)
+        
+        print("\n2. K Value Comparison Analysis")
+        k_comparison = self.analyze_different_k_values()
+        self.plot_k_value_comparison(k_comparison)
+        
+        results = {
+            'token_type_comparison': token_comparison,
+            'k_value_comparison': k_comparison
+        }
+        
+        model_name = self.get_model_name()
+        results_path = os.path.join(output_dir, f"{model_name}_kernel_alignment_results.pkl")
+        with open(results_path, 'wb') as f:
+            pickle.dump(results, f)
+        print(f"\nSaved analysis results to {results_path}")
+        
+        print("\n3. Summary Statistics")
+        self.print_summary_statistics(token_comparison, k_comparison)
         
         return results
-
-def plot_token_kernel_alignment(comparison_results: Dict, save_path: str = "figs/token_kernel_alignment.png"):
-    plt.figure(figsize=(10, 6))
     
-    colors = {
-        'forerunner': '#1f77b4',
-        'last_input_text': '#ff7f0e', 
-        'label': '#2ca02c'
-    }
-    
-    labels = {
-        'forerunner': 'Forerunner Token of Label',
-        'last_input_text': 'Last Token of Input Text',
-        'label': 'Label Token'
-    }
-    
-    for token_type, results in comparison_results.items():
-        if 'kernel_align_vs_bge' in results:
-            alignments = results['kernel_align_vs_bge']
-            layers = list(range(len(alignments)))
-            plt.plot(layers, alignments, color=colors[token_type], 
-                    label=labels[token_type], linewidth=2.5, marker='o', markersize=4)
-
-    if comparison_results:
-        n_layers = len(list(comparison_results.values())[0]['kernel_align_vs_bge'])
-        random_baseline = 8/60
-        layers = list(range(n_layers))
-        plt.axhline(y=random_baseline, color='black', linestyle='--', 
-                   linewidth=2, label='Random Baseline')
-    
-    plt.xlabel('Transformer Block Number', fontsize=20)
-    plt.ylabel('Kernel Alignment', fontsize=20)
-    plt.legend(fontsize=18, loc='best')
-    plt.grid(True, alpha=0.3)
-    plt.xticks(fontsize=18)
-    plt.yticks(fontsize=18)
-    
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.show()
-
-def plot_k_value_kernel_alignment(k_analysis_results: Dict, save_path: str = "figs/k_value_kernel_alignment.png"):
-    plt.figure(figsize=(10, 6))
-    
-    colors = ['#8e44ad', '#e67e22', '#27ae60', '#3498db', '#e74c3c']
-
-    for i, (k, results) in enumerate(sorted(k_analysis_results.items())):
-        if 'kernel_align_vs_bge' in results:
-            alignments = results['kernel_align_vs_bge']
-            layers = list(range(len(alignments)))
-            plt.plot(layers, alignments, color=colors[i % len(colors)], 
-                    label=f'k={k}', linewidth=2.5, marker='o', markersize=4)
-    
-    if k_analysis_results:
-        first_k = list(k_analysis_results.keys())[0]
-        random_baseline = k_analysis_results[first_k]['random_baseline']
-        n_layers = len(k_analysis_results[first_k]['kernel_align_vs_bge'])
-        layers = list(range(n_layers))
-        plt.axhline(y=random_baseline, color='black', linestyle='--', 
-                   linewidth=2, label='Random Baseline')
-    
-    plt.xlabel('Transformer Block Number', fontsize=20)
-    plt.ylabel('Kernel Alignment', fontsize=20)
-    plt.legend(fontsize=18, loc='best')
-    plt.grid(True, alpha=0.3)
-    plt.xticks(fontsize=18)
-    plt.yticks(fontsize=18)
-    
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.show()
+    def print_summary_statistics(self, token_comparison: Dict, k_comparison: Dict):
+        print("\nToken Type Peak Performance (Kernel Alignment):")
+        for token_type, results in token_comparison.items():
+            kernel_means = [result[0] for result in results['kernel_alignments']]
+            max_val = max(kernel_means)
+            max_layer = kernel_means.index(max_val) + 1
+            print(f"  {token_type}: {max_val:.4f} at layer {max_layer}")
+        
+        print("\nK Value Peak Performance (Kernel Alignment):")
+        for k, results in k_comparison.items():
+            kernel_means = [result[0] for result in results['kernel_alignments']]
+            max_val = max(kernel_means)
+            max_layer = kernel_means.index(max_val) + 1
+            print(f"  k={k}: {max_val:.4f} at layer {max_layer}")
+        
+        print("\nToken Type Peak Performance (Cosine Similarity):")
+        for token_type, results in token_comparison.items():
+            cosine_means = [result[0] for result in results['cosine_similarities']]
+            max_val = max(cosine_means)
+            max_layer = cosine_means.index(max_val) + 1
+            print(f"  {token_type}: {max_val:.4f} at layer {max_layer}")
 
 def main():
     import argparse
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_path", type=str, default="./data/InternVL3-8B-Instruct/vlicl_hidden_states_final.pkl")
-    parser.add_argument("--k_neighbors", type=int, default=8)
+    parser.add_argument("--data_path", type=str, default="./data/InternVL3-38B-Instruct/vlicl_hidden_states_final.pkl", help="Path to VL-ICL hidden states pickle file")
+    parser.add_argument("--output_dir", type=str, default="./figs", help="Output directory for results")
     
     args = parser.parse_args()
     
-    print("Loading data...")
-    with open(args.data_path, 'rb') as f:
-        data = pickle.load(f)
-    
-    analyzer = KernelAlignmentAnalyzer(k_neighbors=args.k_neighbors)
-    
-    if 4 in data['data']:
-        print("\n=== Token Type Analysis ===")
-        comparison_results = analyzer.analyze_token_types(data['data'][4])
-        plot_token_kernel_alignment(comparison_results)
-    
-    print("\n=== K Value Analysis ===")
-    k_analysis_results = analyzer.analyze_k_values(data)
-    plot_k_value_kernel_alignment(k_analysis_results)
+    analyzer = VLICLKernelAlignment(args.data_path)
+    results = analyzer.run_complete_analysis(args.output_dir)
 
 if __name__ == "__main__":
     main()

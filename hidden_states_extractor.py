@@ -1,28 +1,28 @@
-import os
-import sys
 import torch
 import numpy as np
+import json
+import os
+from PIL import Image
+from transformers import AutoTokenizer
+import copy
+import random
+from typing import List, Dict
 import pickle
-import gc
-from typing import List, Dict, Tuple
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModel
+import types
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.model_factory import create_model
 from tasks.i2t_tasks import OperatorInductionTask
 
 class VLICLHiddenStatesExtractor:
-    def __init__(self, model_name="OpenGVLab/InternVL3-8B-Instruct", data_dir="./VL-ICL"):
+    def __init__(self, model_name: str, data_dir: str):
         self.model_name = model_name
         self.data_dir = data_dir
         self.model = None
         self.tokenizer = None
         self.task = None
-        self.bge_model = None
-        self.bge_tokenizer = None
-        
-        self.base_instruction = ("The image contains two digit numbers and a ? representing the mathematical operator. "
+        self.base_instruction = ("The image contains two digit numbers and a ? "
+                               "representing the mathematical operator. "
                                "Induce the mathematical operator (addition, multiplication, minus) according to the "
                                "results of the in-context examples and calculate the result.")
         
@@ -31,12 +31,6 @@ class VLICLHiddenStatesExtractor:
         self.model = create_model('internvl', self.model_name)
         self.tokenizer = self.model.tokenizer
         self.task = OperatorInductionTask(self.data_dir)
-        
-    def load_bge_model(self):
-        self.bge_tokenizer = AutoTokenizer.from_pretrained('BAAI/bge-m3')
-        self.bge_model = AutoModel.from_pretrained('BAAI/bge-m3')
-        self.bge_model.cuda()
-        self.bge_model.eval()
         
     def create_vlicl_prompt_and_images(self, query: Dict, n_shot: int = 4):
         demonstrations = self.task.select_demonstrations(query, n_shot)
@@ -60,25 +54,161 @@ class VLICLHiddenStatesExtractor:
         
         full_prompt = "\n\n".join(prompt_parts)
         return full_prompt, images
-    
-    def find_answer_positions(self, prompt: str):
-        inputs = self.tokenizer(prompt, return_tensors='pt')
-        input_ids = inputs['input_ids'].squeeze()
-        tokens = input_ids.tolist()
-        token_texts = [self.tokenizer.decode([tid]) for tid in tokens]
+
+    def find_real_token_positions(self, prompt: str, images: List, n_shot: int):
+        IMG_CONTEXT_TOKEN = '<IMG_CONTEXT>'
+        img_context_token_id = self.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+        
+        actual_input_ids = None
+        original_generate = self.model.model.generate
+        
+        def instrumented_generate(self, pixel_values=None, input_ids=None, attention_mask=None, **kwargs):
+            nonlocal actual_input_ids
+            if input_ids is not None:
+                actual_input_ids = input_ids.clone()
+            return original_generate(pixel_values=pixel_values, input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+        
+        self.model.model.generate = types.MethodType(instrumented_generate, self.model.model)
+        
+        try:
+            with torch.no_grad():
+                generation_config = dict(max_new_tokens=1, do_sample=False)
+                
+                if images:
+                    if len(images) == 1:
+                        pixel_values = self.model.load_image(images[0], max_num=12).to(torch.bfloat16).cuda()
+                        num_patches_list = None
+                    else:
+                        pixel_values_list = []
+                        num_patches_list = []
+                        for img in images:
+                            img_pixel_values = self.model.load_image(img, max_num=6)
+                            pixel_values_list.append(img_pixel_values)
+                            num_patches_list.append(img_pixel_values.size(0))
+                        pixel_values = torch.cat(pixel_values_list, dim=0).to(torch.bfloat16).cuda()
+                    
+                    if num_patches_list is not None:
+                        response = self.model.model.chat(
+                            self.tokenizer, pixel_values, prompt, generation_config, 
+                            num_patches_list=num_patches_list
+                        )
+                    else:
+                        response = self.model.model.chat(
+                            self.tokenizer, pixel_values, prompt, generation_config
+                        )
+                else:
+                    response = self.model.model.chat(
+                        self.tokenizer, None, prompt, generation_config
+                    )
+        finally:
+            self.model.model.generate = original_generate
+        
+        if actual_input_ids is None:
+            raise ValueError("Failed to capture actual input_ids")
+            
+        actual_token_ids = actual_input_ids[0].tolist()
+        actual_token_texts = [self.tokenizer.decode([tid]) for tid in actual_token_ids]
         
         answer_positions = []
         colon_positions = []
         
-        for i, text in enumerate(token_texts):
-            if 'Answer' in text or 'answer' in text:
+        for i, token_text in enumerate(actual_token_texts):
+            if 'Answer' in token_text or 'answer' in token_text:
                 answer_positions.append(i)
-            if ':' in text and i > 0:
+            if ':' in token_text:
                 colon_positions.append(i)
         
-        return answer_positions, colon_positions, len(tokens)
+        if not answer_positions:
+            raise ValueError("No answer positions found in actual token sequence")
+            
+        last_answer_pos = answer_positions[-1]
+        
+        query_forerunner_pos = None
+        for colon_pos in colon_positions:
+            if colon_pos > last_answer_pos:
+                query_forerunner_pos = colon_pos
+                break
+        
+        if query_forerunner_pos is None:
+            query_forerunner_pos = last_answer_pos + 1
+        
+        target_positions = {
+            'query_forerunner': query_forerunner_pos,
+            'last_input_text': last_answer_pos - 1 if last_answer_pos > 0 else 0,
+            'query_label': query_forerunner_pos + 1 if query_forerunner_pos + 1 < len(actual_token_ids) else query_forerunner_pos
+        }
+        
+        query_start_pos = last_answer_pos - 1
+        while query_start_pos > 0 and 'Answer' not in actual_token_texts[query_start_pos]:
+            query_start_pos -= 1
+        
+        if query_start_pos > 0:
+            query_start_pos += 1
+        
+        query_end_pos = len(actual_token_ids) - 1
+        
+        query_positions = list(range(query_start_pos, query_end_pos + 1))
+        
+        if n_shot > 0:
+            expected_query_images = 1
+            query_img_tokens = sum(1 for pos in query_positions if actual_token_ids[pos] == img_context_token_id)
+            expected_img_tokens_per_image = 256
+            expected_query_img_total = expected_query_images * expected_img_tokens_per_image
+            
+            if abs(query_img_tokens - expected_query_img_total) > 50:
+                query_end_adjustment = 0
+                for pos in range(len(actual_token_ids) - 1, query_start_pos - 1, -1):
+                    if actual_token_ids[pos] == img_context_token_id:
+                        query_end_adjustment = max(query_end_adjustment, expected_query_img_total)
+                        break
+                
+                if query_end_adjustment > 0:
+                    query_end_pos = min(len(actual_token_ids) - 1, query_start_pos + 50 + query_end_adjustment)
+                    query_positions = list(range(query_start_pos, query_end_pos + 1))
+        
+        safety_check_passed = True
+        token_verification = {}
+        
+        for pos_name, pos in target_positions.items():
+            if pos >= len(actual_token_texts):
+                safety_check_passed = False
+                break
+            token_text = actual_token_texts[pos]
+            token_id = actual_token_ids[pos]
+            is_img_context = token_id == img_context_token_id
+            
+            token_verification[pos_name] = {
+                'position': pos,
+                'token_text': token_text,
+                'token_id': token_id,
+                'is_img_context': is_img_context
+            }
+            
+            if is_img_context and pos_name in ['query_forerunner', 'last_input_text', 'query_label']:
+                safety_check_passed = False
+                break
+        
+        expected_tokens = {
+            'query_forerunner': ':',
+            'last_input_text': '?',
+            'query_label': ' '
+        }
+        
+        for pos_name, expected in expected_tokens.items():
+            if pos_name in token_verification:
+                actual_token = token_verification[pos_name]['token_text']
+                if expected not in actual_token:
+                    print(f"Warning: {pos_name} expected '{expected}' but got '{actual_token}'")
+        
+        if not safety_check_passed:
+            error_msg = "Safety check failed:\n"
+            for pos_name, info in token_verification.items():
+                error_msg += f"  {pos_name}: pos {info['position']} -> '{info['token_text']}' (IMG_CONTEXT: {info['is_img_context']})\n"
+            raise ValueError(error_msg)
+        
+        return target_positions, query_positions, len(actual_token_ids)
     
-    def extract_representations(self, prompt: str, images: List, target_positions: Dict):
+    def extract_representations(self, prompt: str, images: List, target_positions: Dict, query_positions: List):
         layer_outputs = {}
         hooks = []
         
@@ -90,7 +220,6 @@ class VLICLHiddenStatesExtractor:
                     hidden_states = output
                 if hidden_states.dtype == torch.bfloat16:
                     hidden_states = hidden_states.float()
-                # MEMORY OPTIMIZATION: Only keep what we need, move to CPU immediately
                 layer_outputs[layer_name] = hidden_states.detach().cpu()
             return hook_fn
         
@@ -132,16 +261,35 @@ class VLICLHiddenStatesExtractor:
                     response = self.model.model.chat(
                         self.tokenizer, None, prompt, generation_config
                     )
-                
-                # MEMORY OPTIMIZATION: Clear GPU cache after forward pass
-                torch.cuda.empty_cache()
         
         finally:
             for hook in hooks:
                 hook.remove()
         
-        # Extract specific positions and convert to numpy
         extracted_reps = {}
+        query_mean_pooled = []
+        
+        for layer_idx in range(num_layers):
+            layer_name = f"layer_{layer_idx}"
+            if layer_name in layer_outputs:
+                hidden_states = layer_outputs[layer_name]
+                
+                if hidden_states.dim() == 3:
+                    seq_len = hidden_states.shape[1]
+                    
+                    valid_query_positions = [pos for pos in query_positions if 0 <= pos < seq_len]
+                    
+                    if valid_query_positions:
+                        query_states = hidden_states[0, valid_query_positions, :].numpy()
+                        query_mean = np.mean(query_states, axis=0)
+                        query_mean_pooled.append(query_mean)
+                    else:
+                        query_mean_pooled.append(np.zeros(3584))
+                else:
+                    query_mean_pooled.append(np.zeros(3584))
+            else:
+                query_mean_pooled.append(np.zeros(3584))
+        
         for pos_name, pos in target_positions.items():
             layer_reps = []
             for layer_idx in range(num_layers):
@@ -152,153 +300,37 @@ class VLICLHiddenStatesExtractor:
                         rep = hidden_states[0, pos, :].numpy()
                         layer_reps.append(rep)
                     else:
-                        # Get hidden dimension from first valid layer
-                        if layer_idx == 0 and hidden_states.dim() == 3:
-                            hidden_dim = hidden_states.shape[-1]
-                        else:
-                            hidden_dim = 3584  # fallback
-                        layer_reps.append(np.zeros(hidden_dim))
+                        layer_reps.append(np.zeros(3584))
                 else:
                     layer_reps.append(np.zeros(3584))
             extracted_reps[pos_name] = layer_reps
         
-        # Add mean-pooling across tokens for each layer
-        mean_pooling_reps = []
-        for layer_idx in range(num_layers):
-            layer_name = f"layer_{layer_idx}"
-            if layer_name in layer_outputs:
-                hidden_states = layer_outputs[layer_name]
-                if hidden_states.dim() == 3:
-                    mean_pooled = torch.mean(hidden_states[0], dim=0).numpy()
-                    mean_pooling_reps.append(mean_pooled)
-                else:
-                    if layer_idx == 0 and hidden_states.dim() == 3:
-                        hidden_dim = hidden_states.shape[-1]
-                    else:
-                        hidden_dim = 3584  # fallback
-                    mean_pooling_reps.append(np.zeros(hidden_dim))
-            else:
-                mean_pooling_reps.append(np.zeros(3584))
-        
-        extracted_reps['mean_pooling'] = mean_pooling_reps
-        
-        layer_outputs.clear()
-        del layer_outputs
-        gc.collect()
+        extracted_reps['query_mean_pooled'] = query_mean_pooled
         
         return extracted_reps
-    
-    def get_bge_reference_embedding(self, query_identifier: str):
-        if self.bge_model is None:
-            self.load_bge_model()
-        
-        inputs = self.bge_tokenizer(query_identifier, return_tensors='pt', truncation=True, max_length=512)
-        inputs = {k: v.cuda() for k, v in inputs.items()}
-        
-        with torch.no_grad():
-            outputs = self.bge_model(**inputs)
-            embedding_tensor = outputs.last_hidden_state[:, 0, :].squeeze().cpu()
-            if embedding_tensor.dtype == torch.bfloat16:
-                embedding_tensor = embedding_tensor.float()
-            embedding = embedding_tensor.numpy()
-        
-        # MEMORY OPTIMIZATION: Clear BGE inputs
-        del inputs, outputs, embedding_tensor
-        torch.cuda.empty_cache()
-        
-        return embedding
-    
-    def get_bge_token_embeddings(self):
-        """Get BGE embeddings for the three critical token types"""
-        if self.bge_model is None:
-            self.load_bge_model()
-        
-        token_texts = {
-            'forerunner': "mathematical operator forerunner token",
-            'last_input': "last input text token", 
-            'label': "result label token"
-        }
-        
-        token_embeddings = {}
-        for token_name, token_text in token_texts.items():
-            inputs = self.bge_tokenizer(token_text, return_tensors='pt', truncation=True, max_length=512)
-            inputs = {k: v.cuda() for k, v in inputs.items()}
-            
-            with torch.no_grad():
-                outputs = self.bge_model(**inputs)
-                embedding_tensor = outputs.last_hidden_state[:, 0, :].squeeze().cpu()
-                if embedding_tensor.dtype == torch.bfloat16:
-                    embedding_tensor = embedding_tensor.float()
-                token_embeddings[token_name] = embedding_tensor.numpy()
-            
-            # MEMORY OPTIMIZATION: Clear intermediate tensors
-            del inputs, outputs, embedding_tensor
-        
-        torch.cuda.empty_cache()
-        return token_embeddings
-    
-    def create_unique_query_identifier(self, query: Dict, sample_idx: int):
-        operator = query.get('operator', 'unknown')
-        base_text = f"Mathematical expression with {operator} operator"
-        
-        if 'image' in query and query['image']:
-            img_info = f"image_{os.path.basename(query['image'][0])}"
-            unique_text = f"{base_text} {img_info} sample_{sample_idx}"
-        else:
-            unique_text = f"{base_text} sample_{sample_idx}"
-        
-        return unique_text
     
     def process_single_sample(self, query: Dict, n_shot: int = 4, sample_idx: int = 0):
         prompt, images = self.create_vlicl_prompt_and_images(query, n_shot)
         
-        answer_positions, colon_positions, text_len = self.find_answer_positions(prompt)
+        target_positions, query_positions, actual_seq_len = self.find_real_token_positions(prompt, images, n_shot)
         
-        if not answer_positions:
-            raise ValueError(f"No answer positions found in sample {sample_idx}")
-        
-        last_answer_pos = answer_positions[-1]
-        
-        query_forerunner_pos = None
-        for colon_pos in colon_positions:
-            if colon_pos > last_answer_pos:
-                query_forerunner_pos = colon_pos
-                break
-        
-        if query_forerunner_pos is None:
-            query_forerunner_pos = last_answer_pos + 1
-        
-        target_positions = {
-            'query_forerunner': query_forerunner_pos,
-            'last_input_text': last_answer_pos - 1 if last_answer_pos > 0 else 0,
-            'query_label': query_forerunner_pos + 1 if query_forerunner_pos + 1 < text_len else query_forerunner_pos
-        }
-        
-        extracted_reps = self.extract_representations(prompt, images, target_positions)
-        
-        query_identifier = self.create_unique_query_identifier(query, sample_idx)
-        bge_reference = self.get_bge_reference_embedding(query_identifier)
-        bge_token_embeddings = self.get_bge_token_embeddings()
+        extracted_reps = self.extract_representations(prompt, images, target_positions, query_positions)
         
         results = {
             'query_forerunner': extracted_reps['query_forerunner'],
             'last_input_text': extracted_reps['last_input_text'],
             'query_label': extracted_reps['query_label'],
-            'mean_pooling': extracted_reps['mean_pooling'],
-            'bge_reference': bge_reference,
-            'bge_token_embeddings': bge_token_embeddings,
+            'query_mean_pooled': extracted_reps['query_mean_pooled'],
             'sample_info': {
                 'operator': query.get('operator', 'unknown'),
                 'n_shot': n_shot,
                 'num_images': len(images),
                 'sample_idx': sample_idx,
-                'query_identifier': query_identifier,
-                'target_positions': target_positions
+                'target_positions': target_positions,
+                'query_positions': query_positions,
+                'actual_seq_len': actual_seq_len
             }
         }
-        
-        del extracted_reps
-        gc.collect()
         
         return results
     
@@ -317,49 +349,41 @@ class VLICLHiddenStatesExtractor:
                 
             print(f"\nk={k}:")
             
-            sample_0_forerunner = results['query_forerunner'][0][0]
-            sample_0_last_input = results['last_input_text'][0][0]   
-            sample_0_label = results['query_label'][0][0]
-            sample_0_mean_pool = results['mean_pooling'][0][0]
+            final_layer_idx = len(results['query_forerunner'][0]) - 1
+            sample_0_forerunner = results['query_forerunner'][0][final_layer_idx]
+            sample_0_last_input = results['last_input_text'][0][final_layer_idx]   
+            sample_0_label = results['query_label'][0][final_layer_idx]
             
             within_sim_1 = np.dot(sample_0_forerunner, sample_0_last_input) / (np.linalg.norm(sample_0_forerunner) * np.linalg.norm(sample_0_last_input))
             within_sim_2 = np.dot(sample_0_forerunner, sample_0_label) / (np.linalg.norm(sample_0_forerunner) * np.linalg.norm(sample_0_label))
-            within_sim_3 = np.dot(sample_0_forerunner, sample_0_mean_pool) / (np.linalg.norm(sample_0_forerunner) * np.linalg.norm(sample_0_mean_pool))
             
-            print(f"  Within-sample diversity (layer 0):")
+            print(f"  Within-sample diversity (final layer):")
             print(f"    forerunner vs last_input: {within_sim_1:.4f}")
             print(f"    forerunner vs label: {within_sim_2:.4f}")
-            print(f"    forerunner vs mean_pooling: {within_sim_3:.4f}")
-            
-            print(f"  Dimensions:")
-            print(f"    forerunner: {sample_0_forerunner.shape}")
-            print(f"    mean_pooling: {sample_0_mean_pool.shape}")
-            print(f"    bge_reference: {results['bge_reference'][0].shape}")
-            print(f"    bge_token_embeddings: {results['bge_token_embeddings'][0]['forerunner'].shape}")
             
             num_test = min(5, len(results['query_forerunner']))
             cross_sims = []
             
             for i in range(num_test):
                 for j in range(i+1, num_test):
-                    rep_i = results['query_forerunner'][i][0]
-                    rep_j = results['query_forerunner'][j][0]
+                    rep_i = results['query_forerunner'][i][final_layer_idx]
+                    rep_j = results['query_forerunner'][j][final_layer_idx]
                     cos_sim = np.dot(rep_i, rep_j) / (np.linalg.norm(rep_i) * np.linalg.norm(rep_j))
                     cross_sims.append(cos_sim)
             
             if cross_sims:
                 avg_cross_sim = np.mean(cross_sims)
                 max_cross_sim = np.max(cross_sims)
-                print(f"  Cross-sample diversity (layer 0):")
+                print(f"  Cross-sample diversity (final layer):")
                 print(f"    average similarity: {avg_cross_sim:.4f}")
                 print(f"    max similarity: {max_cross_sim:.4f}")
                 
                 if k == 0:
                     print(f"    (k=0: high similarity expected for same image files)")
                 elif avg_cross_sim < 0.95:
-                    print(f"    ✅ Good diversity")
+                    print(f"    Good diversity")
                 else:
-                    print(f"    ⚠️  High similarity")
+                    print(f"    High similarity")
     
     def extract_complete_dataset(self, num_samples: int = 100, k_values: List[int] = [0, 1, 2, 4, 8], save_path: str = "vlicl_hidden_states.pkl"):
         if self.model is None:
@@ -376,22 +400,19 @@ class VLICLHiddenStatesExtractor:
                 'k_values': k_values,
                 'task': 'operator_induction',
                 'base_instruction': self.base_instruction,
-                'extraction_method': 'memory_optimized_version'
+                'extraction_method': 'mean_pooled_query_reference'
             },
             'data': {}
         }
         
         for k in k_values:
             print(f"\nProcessing k={k}...")
-            print(f"GPU Memory before k={k}: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
             
             k_results = {
                 'query_forerunner': [],
                 'last_input_text': [],
                 'query_label': [],
-                'mean_pooling': [],
-                'bge_reference': [],
-                'bge_token_embeddings': [],
+                'query_mean_pooled': [],
                 'sample_info': []
             }
             
@@ -399,28 +420,15 @@ class VLICLHiddenStatesExtractor:
                 try:
                     sample_results = self.process_single_sample(query, k, sample_idx=i)
                     
-                    for key in ['query_forerunner', 'last_input_text', 'query_label', 'mean_pooling', 'bge_reference', 'bge_token_embeddings', 'sample_info']:
+                    for key in ['query_forerunner', 'last_input_text', 'query_label', 'query_mean_pooled', 'sample_info']:
                         k_results[key].append(sample_results[key])
-                    
-                    del sample_results
-                    
-                    if (i + 1) % 10 == 0:
-                        gc.collect()
-                        torch.cuda.empty_cache()
-                        print(f"  Sample {i+1}/{len(query_samples)}: GPU Memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
                     
                 except Exception as e:
                     print(f"Error processing sample {i} for k={k}: {e}")
-                    torch.cuda.empty_cache()
-                    gc.collect()
                     continue
             
             complete_results['data'][k] = k_results
             print(f"k={k} completed: {len(k_results['query_forerunner'])} samples")
-            
-            gc.collect()
-            torch.cuda.empty_cache()
-            print(f"GPU Memory after k={k}: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
         
         self.validate_final_results(complete_results)
         
@@ -432,7 +440,8 @@ class VLICLHiddenStatesExtractor:
         with open(save_path, 'wb') as f:
             pickle.dump(complete_results, f)
         
-        print("✅ Extraction complete!")
+        print("Extraction complete!")
+        
         print(f"\nFinal data structure:")
         for k, k_data in complete_results['data'].items():
             if k_data['query_forerunner']:
@@ -440,8 +449,6 @@ class VLICLHiddenStatesExtractor:
                 n_layers = len(k_data['query_forerunner'][0])
                 hidden_dim = k_data['query_forerunner'][0][0].shape[0]
                 print(f"  k={k}: {n_samples} samples × {n_layers} layers × {hidden_dim} dims")
-                print(f"    + mean_pooling: {n_samples} samples × {n_layers} layers × {hidden_dim} dims")
-                print(f"    + bge_token_embeddings: 3 token types × 1024 dims")
         
         return complete_results
 
