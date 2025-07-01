@@ -25,11 +25,15 @@ class VLICLHiddenStatesExtractor:
                                "representing the mathematical operator. "
                                "Induce the mathematical operator (addition, multiplication, minus) according to the "
                                "results of the in-context examples and calculate the result.")
+        self.debug_sample_count = {}
         
     def load_model(self):
         print(f"Loading model: {self.model_name}")
         self.model = create_model('internvl', self.model_name)
         self.tokenizer = self.model.tokenizer
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.model.model.generation_config.pad_token_id = self.tokenizer.pad_token_id
         self.task = OperatorInductionTask(self.data_dir)
         
     def create_vlicl_prompt_and_images(self, query: Dict, n_shot: int = 4):
@@ -55,7 +59,7 @@ class VLICLHiddenStatesExtractor:
         full_prompt = "\n\n".join(prompt_parts)
         return full_prompt, images
 
-    def find_real_token_positions(self, prompt: str, images: List, n_shot: int):
+    def find_real_token_positions(self, prompt: str, images: List, n_shot: int, sample_idx: int = 0):
         IMG_CONTEXT_TOKEN = '<IMG_CONTEXT>'
         img_context_token_id = self.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         
@@ -111,12 +115,15 @@ class VLICLHiddenStatesExtractor:
         
         answer_positions = []
         colon_positions = []
+        img_token_positions = []
         
         for i, token_text in enumerate(actual_token_texts):
             if 'Answer' in token_text or 'answer' in token_text:
                 answer_positions.append(i)
             if ':' in token_text:
                 colon_positions.append(i)
+            if actual_token_ids[i] == img_context_token_id:
+                img_token_positions.append(i)
         
         if not answer_positions:
             raise ValueError("No answer positions found in actual token sequence")
@@ -138,33 +145,41 @@ class VLICLHiddenStatesExtractor:
             'query_label': query_forerunner_pos + 1 if query_forerunner_pos + 1 < len(actual_token_ids) else query_forerunner_pos
         }
         
-        query_start_pos = last_answer_pos - 1
-        while query_start_pos > 0 and 'Answer' not in actual_token_texts[query_start_pos]:
-            query_start_pos -= 1
-        
-        if query_start_pos > 0:
-            query_start_pos += 1
-        
-        query_end_pos = len(actual_token_ids) - 1
-        
-        query_positions = list(range(query_start_pos, query_end_pos + 1))
-        
-        if n_shot > 0:
-            expected_query_images = 1
-            query_img_tokens = sum(1 for pos in query_positions if actual_token_ids[pos] == img_context_token_id)
-            expected_img_tokens_per_image = 256
-            expected_query_img_total = expected_query_images * expected_img_tokens_per_image
+        if n_shot == 0:
+            query_start_pos = None
+            for i, token_id in enumerate(actual_token_ids):
+                if token_id == img_context_token_id:
+                    query_start_pos = i
+                    break
+            if query_start_pos is None:
+                raise ValueError("No image tokens found for 0-shot query")
+        else:
+            img_token_groups = []
+            current_group_start = None
             
-            if abs(query_img_tokens - expected_query_img_total) > 50:
-                query_end_adjustment = 0
-                for pos in range(len(actual_token_ids) - 1, query_start_pos - 1, -1):
-                    if actual_token_ids[pos] == img_context_token_id:
-                        query_end_adjustment = max(query_end_adjustment, expected_query_img_total)
-                        break
-                
-                if query_end_adjustment > 0:
-                    query_end_pos = min(len(actual_token_ids) - 1, query_start_pos + 50 + query_end_adjustment)
-                    query_positions = list(range(query_start_pos, query_end_pos + 1))
+            for i, token_id in enumerate(actual_token_ids):
+                if token_id == img_context_token_id:
+                    if current_group_start is None:
+                        current_group_start = i
+                else:
+                    if current_group_start is not None:
+                        img_token_groups.append((current_group_start, i - 1))
+                        current_group_start = None
+            
+            if current_group_start is not None:
+                img_token_groups.append((current_group_start, len(actual_token_ids) - 1))
+            
+            if len(img_token_groups) < n_shot + 1:
+                raise ValueError(f"Expected {n_shot + 1} image groups, found {len(img_token_groups)}")
+            
+            query_img_start, _ = img_token_groups[-1]
+            query_start_pos = query_img_start
+        
+        query_end_pos = last_answer_pos - 1
+        while query_end_pos > query_start_pos and 'Answer' in actual_token_texts[query_end_pos]:
+            query_end_pos -= 1
+        
+        query_positions = list(range(query_start_pos - 1, query_end_pos + 1))
         
         safety_check_passed = True
         token_verification = {}
@@ -199,6 +214,61 @@ class VLICLHiddenStatesExtractor:
                 actual_token = token_verification[pos_name]['token_text']
                 if expected not in actual_token:
                     print(f"Warning: {pos_name} expected '{expected}' but got '{actual_token}'")
+
+        if n_shot not in self.debug_sample_count:
+            self.debug_sample_count[n_shot] = 0
+        
+        should_debug = self.debug_sample_count[n_shot] < 3
+        
+        if should_debug:
+            self.debug_sample_count[n_shot] += 1
+            
+            print(f"\n{'='*60}")
+            print(f"TOKEN POSITION VERIFICATION (k={n_shot}, sample={sample_idx})")
+            print(f"{'='*60}")
+
+            print("Critical Position Tokens:")
+            for pos_name, info in token_verification.items():
+                pos = info['position']
+                token_text = info['token_text']
+                is_img = info['is_img_context']
+                print(f"  {pos_name:20} [pos {pos:4d}]: '{token_text}' (IMG_CONTEXT: {is_img})")
+
+            print(f"\nQuery Positions Range: [{query_positions[0]} - {query_positions[-1]}] (total: {len(query_positions)} tokens)")
+            
+            query_tokens = []
+            img_token_count = 0
+            for pos in query_positions:
+                if pos < len(actual_token_texts):
+                    if actual_token_ids[pos] == img_context_token_id:
+                        query_tokens.append("<IMG_CONTEXT>")
+                    else:
+                        query_tokens.append(actual_token_texts[pos])
+            
+            query_sentence = "".join(query_tokens)
+            print(f"Decoded Query Sentence: '{query_sentence}'")
+            print(f"Query contains {img_token_count} image tokens")
+            
+            print(f"\nContext Around Critical Positions:")
+            for pos_name, info in token_verification.items():
+                pos = info['position']
+                start_ctx = max(0, pos - 2)
+                end_ctx = min(len(actual_token_texts), pos + 3)
+                context_tokens = []
+                
+                for i in range(start_ctx, end_ctx):
+                    if actual_token_ids[i] == img_context_token_id:
+                        context_tokens.append("<IMG>")
+                    else:
+                        if i == pos:
+                            context_tokens.append(f"**{actual_token_texts[i]}**")
+                        else:
+                            context_tokens.append(actual_token_texts[i])
+                
+                context_str = "".join(context_tokens)
+                print(f"  {pos_name:20}: ...{context_str}...")
+            
+            print(f"{'='*60}\n")
         
         if not safety_check_passed:
             error_msg = "Safety check failed:\n"
@@ -312,7 +382,7 @@ class VLICLHiddenStatesExtractor:
     def process_single_sample(self, query: Dict, n_shot: int = 4, sample_idx: int = 0):
         prompt, images = self.create_vlicl_prompt_and_images(query, n_shot)
         
-        target_positions, query_positions, actual_seq_len = self.find_real_token_positions(prompt, images, n_shot)
+        target_positions, query_positions, actual_seq_len = self.find_real_token_positions(prompt, images, n_shot, sample_idx)
         
         extracted_reps = self.extract_representations(prompt, images, target_positions, query_positions)
         
@@ -459,7 +529,7 @@ def main():
     parser.add_argument("--data_dir", type=str, default="./VL-ICL", help="VL-ICL data directory")
     parser.add_argument("--model_name", type=str, default="OpenGVLab/InternVL3-38B-Instruct", help="Model name")
     parser.add_argument("--num_samples", type=int, default=60, help="Number of samples to process")
-    parser.add_argument("--k_values", nargs="+", type=int, default=[0, 1, 2, 4], help="K values to process")
+    parser.add_argument("--k_values", nargs="+", type=int, default=[0, 1, 2, 4, 6], help="K values to process")
     parser.add_argument("--save_path", type=str, default="./data/InternVL3-38B-Instruct/vlicl_hidden_states_final.pkl", help="Save path for results")
     
     args = parser.parse_args()
